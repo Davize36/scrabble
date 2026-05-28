@@ -51,25 +51,20 @@ const isLoadingDictionary = ref(false)
 
 // Check active session on load with timeout
 onMounted(async () => {
-  // Set a timeout for profile loading
-  profileLoadTimeout = setTimeout(() => {
-    if (isLoadingProfile.value && !currentUser.value) {
-      console.error('Profile loading timeout')
-      isLoadingProfile.value = false
-      profileLoadError.value = true
-      errorMessage.value = "Failed to load profile. Please refresh the page."
-    }
-  }, 5000)
-  
-  const { data: { session } } = await supabase.auth.getSession()
-  if (session) {
-    await handleUserSessionFetch(session.user)
-  } else {
-    isLoadingProfile.value = false
-  }
-  
   // Add click listener to close profile menu when clicking outside
   document.addEventListener('click', handleOutsideClick)
+  
+  try {
+    const { data: { session } } = await supabase.auth.getSession()
+    if (session) {
+      await handleUserSessionFetch(session.user)
+    } else {
+      isLoadingProfile.value = false
+    }
+  } catch (err) {
+    console.error('Session check error:', err)
+    isLoadingProfile.value = false
+  }
 })
 
 onBeforeUnmount(() => {
@@ -84,11 +79,12 @@ function handleOutsideClick(event) {
   }
 }
 
-// Listen for auth changes
+// Listen for auth changes - only handle explicit sign out
 supabase.auth.onAuthStateChange(async (event, session) => {
   if (event === 'SIGNED_IN' && session) {
     await handleUserSessionFetch(session.user)
-  } else if (event === 'SIGNED_OUT') {
+  } else if (event === 'SIGNED_OUT' && !session) {
+    // Only clear on explicit sign out, not on page refresh
     currentUser.value = null
     profileData.value = { username: '', wins: 0, losses: 0 }
     authUsername.value = ''
@@ -101,6 +97,7 @@ supabase.auth.onAuthStateChange(async (event, session) => {
 async function handleUserSessionFetch(user) {
   if (!user) {
     isLoadingProfile.value = false
+    profileLoadError.value = false
     return
   }
   
@@ -112,58 +109,48 @@ async function handleUserSessionFetch(user) {
       .from('profiles')
       .select('*')
       .eq('id', user.id)
-      .maybeSingle()
+      .single()
     
-    if (error && error.code !== 'PGRST116') {
-      console.error('Profile fetch error:', error)
-      // Use fallback profile with username or ID
-      profileData.value = {
-        username: authUsername.value || user.id.slice(0, 8),
-        wins: 0,
-        losses: 0
-      }
-    } else if (data) {
+    if (!error && data) {
       profileData.value = data
-    } else {
+      authUsername.value = ''
+    } else if (error && error.code === 'PGRST116') {
       // Profile doesn't exist, create one
       const username = authUsername.value || user.id.slice(0, 8)
       
       const { data: newProfile, error: insertError } = await supabase
         .from('profiles')
-        .upsert({
+        .insert({
           id: user.id,
           username: username,
           wins: 0,
           losses: 0
-        }, { onConflict: 'id' })
+        })
         .select()
         .single()
       
-      if (!insertError && newProfile) {
+      if (newProfile && !insertError) {
         profileData.value = newProfile
         authUsername.value = ''
-      } else if (insertError) {
-        console.error('Profile insert error:', insertError)
-        // Fallback profile
-        profileData.value = {
-          username: username,
-          wins: 0,
-          losses: 0
-        }
-        authUsername.value = ''
+      } else {
+        throw insertError || new Error('Failed to create profile')
       }
+    } else {
+      throw error
     }
   } catch (err) {
-    console.error('Profile handling error:', err)
-    // Set fallback profile on error - use username or ID
+    console.error('Profile error:', err)
+    // Set fallback profile on error
     profileData.value = {
-      username: authUsername.value || currentUser.value?.id?.slice(0, 8) || 'Player',
+      id: user.id,
+      username: authUsername.value || user.id.slice(0, 8) || 'Player',
       wins: 0,
       losses: 0
     }
+    authUsername.value = ''
   } finally {
     isLoadingProfile.value = false
-    if (profileLoadTimeout) clearTimeout(profileLoadTimeout)
+    profileLoadError.value = false
   }
 }
 
@@ -254,32 +241,26 @@ async function loadDictionary() {
       return true
     }
     
-    // Use a smaller word list or skip dictionary loading initially
-    // to avoid long load times
-    const basicWords = ['THE', 'AND', 'FOR', 'YOU', 'ARE', 'THIS', 'THAT', 'WITH', 'FROM', 'HAVE']
-    basicWords.forEach(word => validWordsCache.add(word))
-    
-    // Try to load full dictionary in background
-    fetch('https://raw.githubusercontent.com/dwyl/english-words/master/words_dictionary.json')
-      .then(response => response.json())
-      .then(data => {
-        Object.keys(data).forEach(word => {
-          if (word.length >= 2 && word.length <= 15) {
-            validWordsCache.add(word.toUpperCase())
-          }
-        })
-        try {
-          localStorage.setItem('scrabble_dictionary', JSON.stringify([...validWordsCache]))
-        } catch (e) {
-          console.warn('LocalStorage full, dictionary not cached:', e)
-        }
-      })
-      .catch(err => console.error('Background dictionary load failed:', err))
-    
+    // Load the full dictionary upfront
+    const response = await fetch('https://raw.githubusercontent.com/dwyl/english-words/master/words_dictionary.json')
+    const data = await response.json()
+    Object.keys(data).forEach(word => {
+      if (word.length >= 2 && word.length <= 15) {
+        validWordsCache.add(word.toUpperCase())
+      }
+    })
+    try {
+      localStorage.setItem('scrabble_dictionary', JSON.stringify([...validWordsCache]))
+    } catch (e) {
+      console.warn('LocalStorage full, dictionary not cached:', e)
+    }
     return true
   } catch (error) {
     console.error('Failed to load dictionary:', error)
-    return true // Continue even without dictionary
+    // Fallback: load basic words if full dictionary fails
+    const basicWords = ['THE', 'AND', 'FOR', 'YOU', 'ARE', 'THIS', 'THAT', 'WITH', 'FROM', 'HAVE', 'NOT', 'ALL', 'CAN', 'HER', 'WAS', 'ONE', 'OUR', 'OUT', 'HAD', 'HAS', 'HIS', 'HOW', 'MAN', 'OLD', 'SEE', 'TWO', 'WAY', 'WHO', 'BOY', 'DID', 'CAR', 'LET', 'PUT', 'SAY', 'SHE', 'TOO', 'USE']
+    basicWords.forEach(word => validWordsCache.add(word))
+    return false
   } finally {
     isLoadingDictionary.value = false
   }
@@ -292,12 +273,12 @@ async function isValidWord(word) {
     return VALID_2_LETTER_WORDS.has(word)
   }
   
-  // Only load dictionary if not already loaded, and don't block the UI thread
+  // If dictionary not loaded, load it
   if (validWordsCache.size === 0) {
-    loadDictionary() // Load in background
-    return true // Allow words while dictionary is loading
+    await loadDictionary()
   }
   
+  // Validate the word - if not in cache and cache was loaded, reject it
   return validWordsCache.has(word)
 }
 
@@ -333,7 +314,10 @@ const board2D = computed(() => {
   const grid = []
   const currentBoard = [...boardFlat.value]
   pendingMoves.value.forEach(move => {
-    currentBoard[move.r * 15 + move.c] = move.letter
+    const flatIndex = move.r * 15 + move.c
+    if (flatIndex >= 0 && flatIndex < 225) {
+      currentBoard[flatIndex] = move.letter
+    }
   })
   for (let i = 0; i < 15; i++) {
     grid.push(currentBoard.slice(i * 15, (i + 1) * 15))
@@ -543,6 +527,10 @@ function validatePlacement() {
       errorMessage.value = "The first word must pass through the center tile (Row 8, Column 8)!"
       return false
     }
+    if (pendingMoves.value.length < 2) {
+      errorMessage.value = "The first word must have at least 2 tiles."
+      return false
+    }
     return true
   }
 
@@ -655,13 +643,14 @@ async function handleJoinRoom() {
   loadingMessage.value = "Joining game room..."
   
   try {
+    // Fetch the game with proper error handling
     const { data: gameData, error: fetchError } = await supabase
       .from('games')
       .select('*')
       .eq('room_code', code)
-      .maybeSingle()
+      .single()
 
-    if (fetchError) {
+    if (fetchError && fetchError.code !== 'PGRST116') {
       console.error('Fetch error:', fetchError)
       errorMessage.value = "Error finding room. Please try again."
       return
@@ -679,6 +668,7 @@ async function handleJoinRoom() {
       room.value = code
       isJoined.value = true
       gameDataLoaded = false
+      addToHistory(profileData.value.username, 'reconnected', `${profileData.value.username} reconnected`, null)
       await startSupabaseSubscription(code)
       return
     }
@@ -704,7 +694,8 @@ async function handleJoinRoom() {
         tile_bag: currentBag,
         guest_id: currentUser.value.id,
         status: 'active',
-        join_notification: `${profileData.value.username} has joined!`
+        join_notification: `${profileData.value.username} has joined!`,
+        updated_at: new Date().toISOString()
       })
       .eq('room_code', code)
 
@@ -740,47 +731,56 @@ async function startSupabaseSubscription(roomCode) {
   }
   
   try {
-    // Set up subscription first to avoid race conditions
-    gameChannel = supabase
-      .channel(`room_${roomCode}`)
-      .on('postgres_changes', 
-        { 
-          event: '*', 
-          schema: 'public', 
-          table: 'games',
-          filter: `room_code=eq.${roomCode}`
-        }, 
-        (payload) => {
-          if (payload.eventType === 'DELETE') {
-            resetLocalState()
-            return
-          }
-          if (payload.new && payload.new.room_code === roomCode) {
-            syncStateMap(payload.new)
-          }
-        }
-      )
-      .subscribe()
-    
-    // Then fetch initial data
+    // Fetch initial data first
     const { data, error } = await supabase
       .from('games')
       .select('*')
       .eq('room_code', roomCode)
-      .maybeSingle()
+      .single()
     
-    if (error) {
+    if (error && error.code !== 'PGRST116') {
       console.error('Error fetching game:', error)
       errorMessage.value = "Failed to load game data."
       return
     }
     
-    if (data) {
-      syncStateMap(data)
-    } else {
+    if (!data) {
       errorMessage.value = "Game room not found."
       return
     }
+    
+    // Load initial state
+    syncStateMap(data)
+    
+    // Set up subscription after initial data is loaded
+    gameChannel = supabase
+      .channel(`room_${roomCode}`)
+      .on('postgres_changes', 
+        { 
+          event: 'UPDATE', 
+          schema: 'public', 
+          table: 'games',
+          filter: `room_code=eq.${roomCode}`
+        }, 
+        (payload) => {
+          if (payload.new && payload.new.room_code === roomCode) {
+            syncStateMap(payload.new)
+          }
+        }
+      )
+      .on('postgres_changes',
+        {
+          event: 'DELETE',
+          schema: 'public',
+          table: 'games',
+          filter: `room_code=eq.${roomCode}`
+        },
+        () => {
+          resetLocalState()
+          errorMessage.value = "Game room was deleted."
+        }
+      )
+      .subscribe()
   } catch (err) {
     console.error('Subscription setup error:', err)
     errorMessage.value = "Connection issue. Please refresh."
@@ -791,19 +791,49 @@ async function startSupabaseSubscription(roomCode) {
 function syncStateMap(data) {
   if (!data) return
   
-  boardFlat.value = data.board_state || Array(225).fill('')
-  bag.value = data.tile_bag || []
-  players.value = data.players_json || []
+  // Update board
+  if (Array.isArray(data.board_state)) {
+    boardFlat.value = data.board_state
+  } else {
+    boardFlat.value = Array(225).fill('')
+  }
+  
+  // Update bag
+  if (Array.isArray(data.tile_bag)) {
+    bag.value = data.tile_bag
+  } else {
+    bag.value = []
+  }
+  
+  // Update players
+  if (Array.isArray(data.players_json)) {
+    players.value = data.players_json
+  } else {
+    players.value = []
+  }
+  
   joinMessage.value = data.join_notification || ''
   latestPlayMessage.value = data.latest_play || ''
   
+  // Update current player
   if (players.value.length > 0 && data.current_turn_name) {
     const idx = players.value.findIndex(p => p.name === data.current_turn_name)
     currentPlayerIndex.value = idx !== -1 ? idx : 0
   }
 
-  if (data.status === 'forfeited' || data.status === 'finished') {
-    handleUserSessionFetch(currentUser.value)
+  // Update profile wins/losses if game is finished
+  if (data.status === 'finished' && currentUser.value) {
+    // Refetch profile to get updated wins/losses
+    supabase
+      .from('profiles')
+      .select('wins, losses')
+      .eq('id', currentUser.value.id)
+      .single()
+      .then(({ data: updatedProfile }) => {
+        if (updatedProfile) {
+          profileData.value = { ...profileData.value, ...updatedProfile }
+        }
+      })
   }
   
   gameDataLoaded = true
@@ -811,15 +841,22 @@ function syncStateMap(data) {
 
 // --- CONFIRM AND COMMIT GAME TURN ENGINE ---
 async function confirmTurn() {
-  if (!isMyTurn.value || pendingMoves.value.length === 0) {
-    errorMessage.value = "Not your turn or no tiles placed!"
+  if (!isMyTurn.value) {
+    errorMessage.value = "It's not your turn!"
+    return
+  }
+  
+  if (pendingMoves.value.length === 0) {
+    errorMessage.value = "Place at least one tile!"
     return
   }
   
   if (!validatePlacement()) return
   
-  const isValid = await validateWords(pendingMoves.value)
-  if (!isValid) return
+  isProcessing.value = true
+  try {
+    const isValid = await validateWords(pendingMoves.value)
+    if (!isValid) return
 
   const updatedBoardFlat = [...boardFlat.value]
   const updatedPlayers = JSON.parse(JSON.stringify(players.value))
@@ -888,6 +925,12 @@ async function confirmTurn() {
     .eq('room_code', room.value)
   
   errorMessage.value = ''
+  } catch (err) {
+    console.error('Turn confirmation error:', err)
+    errorMessage.value = "Failed to submit turn. Please try again."
+  } finally {
+    isProcessing.value = false
+  }
 }
 
 async function confirmForfeit() {
@@ -952,18 +995,22 @@ function onCellClick({ r, c }) {
   const currentTime = Date.now()
   const pendingIdx = pendingMoves.value.findIndex(m => m.r === r && m.c === c)
 
+  // Double-click to remove tile
   if (pendingIdx !== -1 && (currentTime - lastClickTime < 300) && lastClickedCell.r === r && lastClickedCell.c === c) {
     pendingMoves.value.splice(pendingIdx, 1)
+    lastClickTime = 0
     return
   }
 
   lastClickTime = currentTime
   lastClickedCell = { r, c }
 
-  if (!selectedLetter.value || !isMyTurn.value) return
-  handleDrop({ r, c })
-  selectedLetter.value = null
-  selectedRackIdx.value = null
+  // Place tile on single click
+  if (selectedLetter.value && isMyTurn.value) {
+    handleDrop({ r, c })
+    selectedLetter.value = null
+    selectedRackIdx.value = null
+  }
 }
 
 function selectTile(letter, rackId) {
@@ -1092,12 +1139,14 @@ const isMyTurn = computed(() => {
 
 const myRack = computed(() => {
   const me = players.value[localPlayerIndex.value]
-  if (!me || !me.rack) return []
-  let workingRack = me.rack.map((t, index) => ({ ...t, rackId: index }))
-  pendingMoves.value.forEach(move => {
-    const idx = workingRack.findIndex(t => t.rackId === move.rackId)
-    if (idx >= 0) workingRack.splice(idx, 1)
-  })
+  if (!me || !me.rack || !Array.isArray(me.rack)) return []
+  let workingRack = me.rack.map((t, index) => ({
+    letter: t.letter || t,
+    pts: t.pts || 0,
+    rackId: index
+  }))
+  const usedIndices = new Set(pendingMoves.value.map(m => m.rackId).filter(id => id !== undefined))
+  workingRack = workingRack.filter((_, idx) => !usedIndices.has(idx))
   return workingRack
 })
 </script>
@@ -2073,4 +2122,4 @@ const myRack = computed(() => {
   .game-header { flex-direction: column; align-items: stretch; }
   .player-info { justify-content: space-between; }
 }
-</style>
+</style>a
