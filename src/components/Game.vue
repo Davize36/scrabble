@@ -99,7 +99,7 @@ onMounted(async () => {
         playerName.value = 'Guest'
       }
     }
-  }, 3000)
+  }, 5000)
   
   try {
     localStorage.removeItem('scrabble_room')
@@ -692,14 +692,30 @@ async function handleJoinRoom() {
   loadingMessage.value = "Joining game room..."
   
   try {
-    const { data: gameData, error: fetchError } = await supabase
-      .from('games')
-      .select('*')
-      .eq('room_code', code)
-      .single()
+    // Dynamically resolve your project credentials straight from the client instance
+    const activeUrl = supabase.supabaseUrl || supabaseUrl
+    const activeKey = supabase.supabaseKey || supabaseKey
 
-    if (fetchError && fetchError.code !== 'PGRST116') throw fetchError
+    if (!activeUrl || !activeKey) {
+      throw new Error("Supabase environment configuration keys are missing or undefined.")
+    }
+
+    // 1. Direct Fetch GET Request to locate the room
+    const getUrl = `${activeUrl}/rest/v1/games?room_code=eq.${code}`
+    const getResponse = await fetch(getUrl, {
+      method: 'GET',
+      headers: {
+        'apikey': activeKey,
+        'Authorization': `Bearer ${activeKey}`,
+        'Content-Type': 'application/json'
+      }
+    })
+
+    if (!getResponse.ok) throw new Error(`Room lookup failed with status: ${getResponse.status}`)
     
+    const rows = await getResponse.json()
+    const gameData = (rows && rows.length > 0) ? rows[0] : null
+
     if (!gameData) {
       errorMessage.value = "Room code not found!"
       return
@@ -710,13 +726,15 @@ async function handleJoinRoom() {
     const currentUserId = currentUser.value?.id || sessionGuestId.value
     const alreadyIn = currentPlayers.some(p => p.id === currentUserId)
     
+    // Check if player is already registered in this room session
     if (alreadyIn) {
       room.value = code
       isJoined.value = true
       gameDataLoaded = false
       profileData.value.username = currentPlayers.find(p => p.id === currentUserId).name
       addToHistory(profileData.value.username, 'reconnected', `${profileData.value.username} reconnected`, null)
-      await startSupabaseSubscription(code)
+      
+      await startSupabaseSubscription(code, gameData)
       return
     }
     
@@ -725,6 +743,7 @@ async function handleJoinRoom() {
       return
     }
     
+    // Draw initial tiles for the joining player
     let currentBag = [...(gameData.tile_bag || [])]
     const startingRack = drawSmartTiles(currentBag, 7)
     currentPlayers.push({ 
@@ -734,37 +753,46 @@ async function handleJoinRoom() {
       score: 0 
     })
     
-    if (currentUser.value && (!profileData.value.username || profileData.value.username === 'Guest')) {
-      await supabase
-        .from('profiles')
-        .update({ username })
-        .eq('id', currentUser.value.id)
-      profileData.value.username = username
+    // 2. Direct Fetch PATCH Request to update the game room state
+    const patchUrl = `${activeUrl}/rest/v1/games?room_code=eq.${code}`
+    const updatedPayload = {
+      players_json: currentPlayers,
+      tile_bag: currentBag,
+      guest_id: currentUserId,
+      status: 'active',
+      join_notification: `${username} has joined!`,
+      updated_at: new Date().toISOString()
     }
+
+    const patchResponse = await fetch(patchUrl, {
+      method: 'PATCH',
+      headers: {
+        'apikey': activeKey,
+        'Authorization': `Bearer ${activeKey}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=representation' // Requests the updated row back from PostgREST
+      },
+      body: JSON.stringify(updatedPayload)
+    })
+
+    if (!patchResponse.ok) throw new Error(`Room update failed with status: ${patchResponse.status}`)
     
-    const { error: updateError } = await supabase
-      .from('games')
-      .update({
-        players_json: currentPlayers,
-        tile_bag: currentBag,
-        guest_id: currentUserId,
-        status: 'active',
-        join_notification: `${username} has joined!`,
-        updated_at: new Date().toISOString()
-      })
-      .eq('room_code', code)
+    const patchDataText = await patchResponse.text()
+    let patchJson = patchDataText ? JSON.parse(patchDataText) : null
+    const updatedRow = Array.isArray(patchJson) ? patchJson[0] : patchJson
 
-    if (updateError) throw updateError
-
+    // Apply states locally
     room.value = code
     isJoined.value = true
     gameDataLoaded = false
     addToHistory(username, 'joined', `${username} joined the game`, null)
-    await startSupabaseSubscription(code)
+    
+    // Feed the fresh data directly to subscription so it doesn't need to perform any blocking fetches
+    await startSupabaseSubscription(code, updatedRow || gameData)
     
   } catch (err) {
-    console.error('Join room error:', err)
-    errorMessage.value = "Failed to join room. Please try again."
+    console.error('Join room network execution error:', err)
+    errorMessage.value = `Failed to join room securely: ${err.message || 'Check connection'}`
   } finally {
     isRoomLoading.value = false
     loadingMessage.value = ''
@@ -973,36 +1001,48 @@ async function confirmForfeit() {
   showForfeitModal.value = false
   if (!room.value) return
   isProcessing.value = true
+  loadingMessage.value = "Forfeiting match..."
   
   try {
-    const { data: gameRecord, error } = await supabase
-      .from('games')
-      .select('*')
-      .eq('room_code', room.value)
-      .maybeSingle()
-      
-    if (error) throw error
+    const currentUsername = profileData.value.username || 'Player'
+    addToHistory(currentUsername, 'forfeited', `${currentUsername} forfeited the game`, null)
     
-    if (gameRecord) {
-      const dbPlayers = gameRecord.players_json || []
-      const currentUserId = currentUser.value?.id || sessionGuestId.value
-      const opponent = dbPlayers.find(p => p.id !== currentUserId)
-      const currentUsername = profileData.value.username || 'Player'
-      
-      addToHistory(currentUsername, 'forfeited', `${currentUsername} forfeited the game`, null)
-      
-      if (opponent && opponent.id && !opponent.id.startsWith('guest-') && currentUser.value) {
-        await supabase.rpc('increment_wins', { user_id: opponent.id })
-        await supabase.rpc('increment_losses', { user_id: currentUser.value.id })
+    // Explicitly shut down real-time channels first
+    if (gameChannel) {
+      try {
+        await supabase.removeChannel(gameChannel)
+      } catch (chErr) {
+        console.warn("Channel cleanup skipped:", chErr)
       }
+      gameChannel = null
     }
-    await supabase.from('games').delete().eq('room_code', room.value)
+
+    // Direct REST API DELETE request bypassing the Supabase client wrapper
+    const url = `${supabaseUrl}/rest/v1/games?room_code=eq.${room.value}`
+    const response = await fetch(url, {
+      method: 'DELETE',
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json'
+      }
+    })
+
+    if (!response.ok) {
+      throw new Error(`Forfeit network request failed with status: ${response.status}`)
+    }
+    
+    // Successfully deleted from database, now clear local UI state
+    resetLocalState()
+    
   } catch (err) {
-    console.error(err)
-    errorMessage.value = "Failed to forfeit game safely."
+    console.error('Forfeit execution error:', err)
+    errorMessage.value = "Failed to forfeit game safely. Forcing exit..."
+    // Force local exit even if network fails so the player isn't stuck
+    resetLocalState()
   } finally {
     isProcessing.value = false
-    resetLocalState()
+    loadingMessage.value = ''
   }
 }
 
@@ -1204,16 +1244,13 @@ const myRack = computed(() => {
     </div>
   </Transition>
 
-  <!-- LOBBY WRAPPER VIEW -->
   <div v-if="!isJoined" class="lobby-wrapper">
-    <!-- TOP INTEGRATED BRAND HEADER -->
     <header class="lobby-brand-bar">
       <div class="brand-left">
         <span class="scrabble-logo-icon">🆂</span>
         <h1 class="main-logo-text">Scrabble<span class="dot-accent">.</span></h1>
       </div>
       
-      <!-- AUTHENTICATED USER DROPDOWN PROFILE ZONE -->
       <div class="user-profile-widget" v-if="currentUser || isGuestMode">
         <div class="user-info" @click="toggleProfileMenu">
           <div class="avatar-circle">
@@ -1249,9 +1286,7 @@ const myRack = computed(() => {
       </div>
     </header>
 
-    <!-- CONTENT DISPLAY SCREEN CONTAINER -->
     <main class="lobby-content-container">
-      <!-- AUTHENTICATION FORM SCREEN -->
       <section v-if="!currentUser && !isLoadingProfile && !isGuestMode" class="auth-panel-card">
         <div class="card-header">
           <h2>{{ isSignUpMode ? 'Create Account' : 'Welcome Back' }}</h2>
@@ -1294,19 +1329,17 @@ const myRack = computed(() => {
             <span class="guest-divider-line"></span>
           </div>
 
-          <button class="base-action-btn guest-btn" @click="signInAsGuest" :disabled="isProcessing">
+          <button class="base-action-btn primary-outline" @click="signInAsGuest" :disabled="isProcessing">
             👤 Continue as Guest
           </button>
         </div>
       </section>
 
-      <!-- SPINNER LOADING CARD -->
       <section v-else-if="isLoadingProfile" class="auth-panel-card central-spinner-layout">
         <div class="spinner-element"></div>
         <p class="loading-label-text">Fetching workspace profile...</p>
       </section>
 
-      <!-- MATCH ROOM CONNECTION LOBBY -->
       <section v-else class="auth-panel-card room-lobby-card">
         <div class="card-header">
           <h2>
@@ -1327,7 +1360,7 @@ const myRack = computed(() => {
 
           <div class="workspace-action-split">
             <div class="action-block-left">
-              <button class="base-action-btn primary-solid-green large-weight" @click="handleCreateRoom">
+              <button class="base-action-btn primary-solid-green" @click="handleCreateRoom">
                 ✨ Create New Arena
               </button>
             </div>
@@ -1339,7 +1372,7 @@ const myRack = computed(() => {
             <div class="action-block-right">
               <div class="join-code-input-wrapper">
                 <input v-model="inputRoomCode" type="text" placeholder="6-CHAR CODE" maxlength="6" class="styled-text-input code-box-format uppercase" />
-                <button class="base-action-btn primary-outline large-weight" @click="handleJoinRoom">
+                <button class="base-action-btn primary-outline" @click="handleJoinRoom">
                   Join Room
                 </button>
               </div>
@@ -1350,9 +1383,7 @@ const myRack = computed(() => {
     </main>
   </div>
 
-  <!-- MAIN GAME ARENA INTERFACE -->
   <div v-else class="game-view-layout">
-    <!-- SANDWICH SLIDE DRAWER SIDEBAR -->
     <aside :class="['sandwich-sidebar', { 'drawer-open': isMenuOpen }]">
       <div class="drawer-header">
         <h3>Match Dashboard</h3>
@@ -1360,7 +1391,6 @@ const myRack = computed(() => {
       </div>
       
       <div class="drawer-body">
-        <!-- BAG STATE COUNTER CARD -->
         <div class="bag-counter-card">
           <div class="bag-stat">
             <span class="bag-qty">{{ bag.length }}</span>
@@ -1368,7 +1398,6 @@ const myRack = computed(() => {
           </div>
         </div>
 
-        <!-- LIVE STREAM HISTORY TIMELINE -->
         <div class="history-section">
           <h4>Game History</h4>
           <div class="history-timeline">
@@ -1393,7 +1422,6 @@ const myRack = computed(() => {
           </div>
         </div>
 
-        <!-- SIDEBAR ACTIONS FOOTER -->
         <div class="sidebar-footer-actions">
           <button class="btn-sidebar-forfeit" @click="showForfeitModal = true">
             🏳️ Forfeit Match
@@ -1402,12 +1430,9 @@ const myRack = computed(() => {
       </div>
     </aside>
 
-    <!-- SIDEBAR DRAWER OVERLAY BACKDROP -->
     <div v-if="isMenuOpen" class="drawer-backdrop" @click="toggleMenu"></div>
 
-    <!-- ARENA CONTENT STRUCTURE -->
     <div class="arena-main-content">
-      <!-- TOP MATCH STATUS INFORMATION ACTION BAR -->
       <header class="arena-status-bar">
         <div class="bar-left-cluster">
           <button class="sandwich-trigger" @click="toggleMenu">
@@ -1421,7 +1446,6 @@ const myRack = computed(() => {
           </div>
         </div>
 
-        <!-- SCOREBOARD STATUS CLUSTER DISPLAY -->
         <div class="arena-scoreboard">
           <div v-for="(p, index) in players" :key="p.id || index" :class="['score-pill', { 'active-turn-indicator': index === currentPlayerIndex, 'is-me-pill': p.id === (currentUser?.id || sessionGuestId) }]">
             <span class="turn-dot"></span>
@@ -1438,17 +1462,15 @@ const myRack = computed(() => {
         </div>
       </header>
 
-      <!-- SYSTEM GAME BOARD AND RACK CONTROLS WRAPPER -->
       <main class="arena-layout-plane">
-        <!-- SYSTEM INTERACTIVE GAME GRID MATRICES -->
-        <div class="board-wrapper-frame">
-          <Board :board="board2D" :pending-moves="pendingMoves" @cell-click="onCellClick" @drop-tile="handleDrop" @dragstart-placed="onBoardTileDragStart" />
+        <div class="board-wrapper">
+          <div class="board-wrapper-frame">
+            <Board :board="board2D" :pending-moves="pendingMoves" @cell-click="onCellClick" @drop-tile="handleDrop" @dragstart-placed="onBoardTileDragStart" />
+          </div>
         </div>
 
-        <!-- LOWER PLAYERS HAND RACK CONTROLLER ZONE -->
         <footer class="player-interaction-dock">
           <div class="interaction-dock-inner">
-            <!-- CURRENT PLAYER HAND TILES RACK DECK -->
             <div class="rack-outer-frame">
               <div class="rack-wood-shelf">
                 <div class="rack-tiles-container">
@@ -1458,23 +1480,36 @@ const myRack = computed(() => {
               <div class="rack-base-shadow"></div>
             </div>
 
-            <!-- CORE GAME EXECUTION TURN BUTTON ROW -->
-            <div class="action-button-matrix-row">
-              <button class="control-btn play-turn-btn" @click="confirmTurn" :disabled="!isMyTurn || pendingMoves.length === 0">
-                🚀 Play Turn
-              </button>
-              <button class="control-btn utility-btn" @click="recallTiles" :disabled="pendingMoves.length === 0">
-                ↩️ Recall
-              </button>
-              <button class="control-btn utility-btn" @click="exchange" :disabled="!isMyTurn || pendingMoves.length > 0">
-                🔄 Exchange
-              </button>
-              <button class="control-btn utility-btn" @click="pass" :disabled="!isMyTurn || pendingMoves.length > 0">
-                ⏭️ Pass
-              </button>
+            <div class="controls">
+              <div class="scores">
+                <h3>Arena Scores</h3>
+                <div v-for="(p, index) in players" :key="p.id || index" :class="['player-row', { 'active-player': index === currentPlayerIndex }]">
+                  <span class="dot">●</span>
+                  <span class="p-name">{{ p.name }} <template v-if="p.id === (currentUser?.id || sessionGuestId)">(You)</template></span>
+                  <span class="p-score">{{ p.score }} pts</span>
+                </div>
+              </div>
+
+              <div class="actions">
+                <div class="action-button-matrix-row">
+                  <button class="control-btn play-turn-btn" @click="confirmTurn" :disabled="!isMyTurn || pendingMoves.length === 0">
+                    🚀 Play Turn
+                  </button>
+                  <button class="control-btn utility-btn" @click="recallTiles" :disabled="pendingMoves.length === 0">
+                    ↩️ Recall
+                  </button>
+                </div>
+                <div class="action-button-matrix-row">
+                  <button class="control-btn utility-btn" @click="exchange" :disabled="!isMyTurn || pendingMoves.length > 0">
+                    🔄 Exchange
+                  </button>
+                  <button class="control-btn utility-btn" @click="pass" :disabled="!isMyTurn || pendingMoves.length > 0">
+                    ⏭️ Pass
+                  </button>
+                </div>
+              </div>
             </div>
 
-            <!-- DYNAMIC INTERACTION CONSOLE ERROR ALERTS -->
             <div class="error-console-wrapper">
               <Transition name="fade">
                 <p v-if="errorMessage" class="console-error-message">
@@ -1855,7 +1890,7 @@ const myRack = computed(() => {
 }
 
 .base-action-btn.guest-btn {
-  display: none !important; /* Visual safety gate: hidden completely from layout view but keeps logic active */
+  display: none !important;
 }
 
 .info-username {
@@ -2025,7 +2060,7 @@ const myRack = computed(() => {
   letter-spacing: 0.5px;
 }
 
-/* MATCH ARENA REALTIME SCOREBOARD */
+/* MATCH ARENA REALTIME SCOREBOARD PILLS */
 .arena-scoreboard {
   display: flex;
   gap: 12px;
@@ -2125,27 +2160,39 @@ const myRack = computed(() => {
   flex: 1;
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: center;
-  padding: 16px;
+  padding: 12px;
   box-sizing: border-box;
   overflow-y: auto;
+  overflow-x: hidden;
+  width: 100%;
+}
+
+/* BOARD WORKSPACE ADAPTIVE OVERFLOW BOUNDS */
+.board-wrapper { 
+  position: relative; 
+  width: 100%;
+  max-width: min(480px, 94vw);
+  margin: 0 auto 16px auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
 .board-wrapper-frame {
-  flex: 1;
   display: flex;
   justify-content: center;
   align-items: center;
   width: 100%;
-  min-height: 0;
+  margin-bottom: 0px !important;
 }
 
-/* INTERACTION CONSOLE CONTROL LABELS */
+/* INTERACTION CONSOLE CONTROL LABELS & INTEGRATED SIDE DASHBOARD */
 .player-interaction-dock {
   width: 100%;
-  max-width: 680px;
-  margin-top: 16px;
+  max-width: 480px;
+  margin-top: 8px;
   flex-shrink: 0;
 }
 
@@ -2153,14 +2200,20 @@ const myRack = computed(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 14px;
+  gap: 10px;
+  width: 100%;
 }
 
 /* WOOD SHELF TILES CONTROLLER TRACKS */
+.rack-wrapper { 
+  width: 100%;
+  max-width: 100%; 
+  margin: 0 auto 12px auto;
+}
+
 .rack-outer-frame {
   position: relative;
   width: 100%;
-  max-width: 480px;
 }
 
 .rack-wood-shelf {
@@ -2168,18 +2221,40 @@ const myRack = computed(() => {
   border-top: 1px solid #f6e05e;
   border-bottom: 2px solid #744210;
   border-radius: 4px;
-  padding: 8px 16px;
+  padding: 6px 12px;
   box-shadow: 0 6px 10px rgba(0,0,0,0.3), inset 0 1px 2px rgba(255,255,255,0.2);
   display: flex;
   justify-content: center;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .rack-tiles-container {
   display: flex;
-  gap: 6px;
-  min-height: 48px;
+  gap: min(6px, 1.5vw);
+  min-height: 40px;
   justify-content: center;
   align-items: center;
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Force children tile components inside the container row to scale intelligently */
+.rack-tiles-container > * {
+  flex-shrink: 1 !important;
+  max-width: calc((100% / 7) - 4px) !important;
+  aspect-ratio: 1 / 1;
+}
+
+.rack { 
+  display: flex; 
+  gap: 8px; 
+  justify-content: center; 
+  background: #eae2d2; 
+  padding: 12px; 
+  border-radius: 8px; 
+  min-height: 56px; 
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
 }
 
 .rack-base-shadow {
@@ -2194,21 +2269,85 @@ const myRack = computed(() => {
   z-index: 1;
 }
 
-/* ACTION BUTTON MATRIX DESIGN */
+/* THE SPLIT CONTROLS PANEL GRID RULES */
+.controls { 
+  display: grid; 
+  grid-template-columns: 1fr 1fr; 
+  gap: 16px; 
+  width: 100%;
+  max-width: 100%; 
+  margin: 8px auto; 
+  background: #1a252f; 
+  padding: 12px; 
+  border-radius: 8px; 
+  border: 1px solid #34495e; 
+  text-align: left; 
+  box-sizing: border-box;
+}
+
+.scores h3 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  color: #ecc94b; 
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: bold;
+}
+
+.player-row { 
+  display: flex; 
+  align-items: center; 
+  gap: 8px; 
+  padding: 4px 0; 
+  color: #bdc3c7; 
+  border-bottom: 1px solid rgba(52, 73, 94, 0.4);
+}
+.player-row:last-child {
+  border-bottom: none;
+}
+
+.active-player { 
+  font-weight: bold; 
+  color: #ffffff; 
+}
+
+.active-player .dot { 
+  color: #4caf50; 
+}
+
+.p-name {
+  font-size: 12px;
+}
+
+.p-score { 
+  margin-left: auto; 
+  font-weight: bold;
+  color: #ffffff;
+}
+
+.actions { 
+  display: flex; 
+  flex-direction: column; 
+  gap: 8px; 
+  justify-content: center; 
+}
+
+/* ACTION BUTTON MATRIX BUTTON DESIGN CONFIG */
 .action-button-matrix-row {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   width: 100%;
 }
 
 .control-btn {
-  padding: 12px 16px;
+  padding: 10px 12px;
   border: none;
   border-radius: 6px;
-  font-size: 14px;
+  font-size: min(13px, 3.2vw);
   font-weight: 700;
   cursor: pointer;
   transition: all 0.15s ease;
+  white-space: nowrap;
 }
 
 .control-btn:disabled {
@@ -2237,25 +2376,26 @@ const myRack = computed(() => {
 
 /* ALERTS SYSTEM ERROR LABELS */
 .error-console-wrapper {
-  height: 20px;
+  min-height: 20px;
+  width: 100%;
 }
 
 .console-error-message {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   color: #fc8181;
-  margin: 0;
+  margin: 4px 0 0 0;
   display: flex;
   align-items: center;
   gap: 6px;
 }
 
-/* --- SIDEBAR PANEL DRAWER SYSTEM CSS STYLE --- */
+/* --- SIDEBAR PANEL DRAWER SYSTEM --- */
 .sandwich-sidebar {
   position: fixed;
   top: 0;
   left: 0;
-  width: 320px;
+  width: 300px;
   height: 100vh;
   background-color: #1a252f;
   border-right: 1px solid #2c3e50;
@@ -2272,7 +2412,7 @@ const myRack = computed(() => {
 }
 
 .drawer-header {
-  padding: 20px;
+  padding: 16px;
   border-bottom: 1px solid #2c3e50;
   display: flex;
   justify-content: space-between;
@@ -2282,7 +2422,7 @@ const myRack = computed(() => {
 
 .drawer-header h3 {
   margin: 0;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 700;
   color: #ffffff;
 }
@@ -2301,15 +2441,15 @@ const myRack = computed(() => {
   flex: 1;
   display: flex;
   flex-direction: column;
-  padding: 20px;
+  padding: 16px;
   overflow-y: auto;
-  gap: 24px;
+  gap: 20px;
 }
 
 .bag-counter-card {
   background-color: #2c3e50;
   border-radius: 8px;
-  padding: 16px;
+  padding: 12px;
   border: 1px solid #34495e;
 }
 
@@ -2321,13 +2461,13 @@ const myRack = computed(() => {
 }
 
 .bag-qty {
-  font-size: 28px;
+  font-size: 24px;
   font-weight: 800;
   color: #ecc94b;
 }
 
 .bag-lbl {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   color: #a0aec0;
   text-transform: uppercase;
@@ -2343,8 +2483,8 @@ const myRack = computed(() => {
 }
 
 .history-section h4 {
-  margin: 0 0 12px 0;
-  font-size: 13px;
+  margin: 0 0 10px 0;
+  font-size: 12px;
   font-weight: 700;
   color: #e2e8f0;
   text-transform: uppercase;
@@ -2356,35 +2496,35 @@ const myRack = computed(() => {
   background-color: #111827;
   border: 1px solid #2c3e50;
   border-radius: 8px;
-  padding: 10px;
+  padding: 8px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .timeline-log-row {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 8px;
+  gap: 8px;
+  padding: 6px;
   background-color: #1f2937;
   border-radius: 6px;
   border: 1px solid #2c3e50;
 }
 
-.log-icon { font-size: 14px; }
+.log-icon { font-size: 13px; }
 .log-details-box { flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .log-text-line { margin: 0; font-size: 12px; color: #e2e8f0; line-height: 1.3; }
 .log-player { color: #63b3ed; }
-.log-timestamp { font-size: 10px; color: #718096; }
+.log-timestamp { font-size: 9px; color: #718096; }
 
 .log-score-badge {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   background-color: #2d3748;
   color: #a0aec0;
-  padding: 2px 6px;
+  padding: 2px 4px;
   border-radius: 4px;
 }
 .log-score-badge.high-score {
@@ -2393,7 +2533,7 @@ const myRack = computed(() => {
 }
 
 .empty-history {
-  padding: 20px;
+  padding: 16px;
   text-align: center;
   color: #718096;
   font-size: 12px;
@@ -2408,7 +2548,7 @@ const myRack = computed(() => {
   width: 100%;
   background: none;
   border: 1px solid #742a2a;
-  padding: 12px;
+  padding: 10px;
   border-radius: 6px;
   color: #feb2b2;
   font-weight: 600;
@@ -2449,12 +2589,12 @@ const myRack = computed(() => {
   border-radius: 12px;
   padding: 24px;
   width: 100%;
-  max-width: 400px;
+  max-width: 360px;
   box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1);
 }
 
-.confirm-modal-box h3 { margin: 0 0 8px 0; color: #1a202c; font-size: 18px; font-weight: 700; }
-.confirm-modal-box p { margin: 0 0 20px 0; color: #4a5568; font-size: 14px; line-height: 1.4; }
+.confirm-modal-box h3 { margin: 0 0 8px 0; color: #1a202c; font-size: 17px; font-weight: 700; }
+.confirm-modal-box p { margin: 0 0 16px 0; color: #4a5568; font-size: 14px; line-height: 1.4; }
 
 .modal-button-row { display: flex; gap: 8px; }
 .modal-btn { flex: 1; padding: 10px; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; }
@@ -2468,7 +2608,7 @@ const myRack = computed(() => {
   left: 50%;
   transform: translateX(-50%);
   background: linear-gradient(135deg, #ecc94b 0%, #d69e2e 100%);
-  padding: 20px 40px;
+  padding: 16px 32px;
   border-radius: 16px;
   box-shadow: 0 10px 30px rgba(0,0,0,0.25), 0 0 0 4px rgba(255,255,255,0.2);
   text-align: center;
@@ -2476,9 +2616,9 @@ const myRack = computed(() => {
   border: 1px solid #f6e05e;
 }
 
-.bingo-stars { font-size: 32px; display: block; margin-bottom: 4px; }
-.bingo-popup-overlay h2 { margin: 0; font-size: 36px; font-weight: 900; color: #1a202c; letter-spacing: 2px; text-shadow: 0 2px 4px rgba(255,255,255,0.4); }
-.bingo-popup-overlay p { margin: 4px 0 0 0; font-size: 14px; font-weight: 700; color: #2d3748; }
+.bingo-stars { font-size: 28px; display: block; margin-bottom: 4px; }
+.bingo-popup-overlay h2 { margin: 0; font-size: 30px; font-weight: 900; color: #1a202c; letter-spacing: 1px; text-shadow: 0 2px 4px rgba(255,255,255,0.4); }
+.bingo-popup-overlay p { margin: 4px 0 0 0; font-size: 13px; font-weight: 700; color: #2d3748; }
 
 /* --- VUE TRANSITIONS RULES ANIMATIONS --- */
 .fade-enter-active, .fade-leave-active { transition: opacity 0.3s; }
@@ -2487,7 +2627,7 @@ const myRack = computed(() => {
 .dropdown-slide-enter-active, .dropdown-slide-leave-active { transition: all 0.2s ease; }
 .dropdown-slide-enter-from, .dropdown-slide-leave-to { opacity: 0; transform: translateY(-10px); }
 
-/* NEW OVERLAY SPIN LOADING STYLE SPECIFIC FOR LOADING OVERLAYS */
+/* LOADING OVERLAYS */
 .loading-overlay {
   position: fixed;
   top: 0;
@@ -2503,7 +2643,7 @@ const myRack = computed(() => {
 
 .spinner-box {
   background-color: #ffffff;
-  padding: 30px;
+  padding: 24px;
   border-radius: 12px;
   display: flex;
   flex-direction: column;
@@ -2512,8 +2652,8 @@ const myRack = computed(() => {
 }
 
 .spinner {
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   border: 4px solid #f3f3f3;
   border-top: 4px solid #3498db;
   border-radius: 50%;
@@ -2521,9 +2661,70 @@ const myRack = computed(() => {
 }
 
 .loading-text {
-  margin-top: 15px;
+  margin-top: 12px;
   font-weight: 600;
   color: #2c3e50;
-  font-size: 15px;
+  font-size: 14px;
+}
+
+/* --- MOBILE & HIGH FIDELITY ADAPTATION RECTIFIER INJECTIONS --- */
+@media (max-width: 768px) {
+  .lobby-brand-bar {
+    padding: 12px 16px;
+  }
+  .auth-panel-card {
+    padding: 24px 16px;
+  }
+  .workspace-action-split {
+    flex-direction: column;
+    gap: 16px;
+  }
+  .split-vertical-divider {
+    display: none;
+  }
+
+  .arena-status-bar {
+    padding: 0 12px;
+    height: 56px;
+  }
+  .arena-scoreboard {
+    display: none; /* Hide top raw values in favor of the clean dedicated dashboard panel below */
+  }
+  .live-status-ticker {
+    max-width: 180px;
+  }
+
+  .board-wrapper-frame {
+    padding: 0;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 0px !important;
+  }
+
+  :deep(.board-grid), 
+  :deep(.scrabble-board),
+  .board-wrapper-frame > div {
+    max-width: 100% !important;
+    width: 100% !important;
+    height: auto !important;
+    aspect-ratio: 1 / 1;
+  }
+
+  :deep(.board-cell) {
+    font-size: min(10px, 2.5vw) !important;
+  }
+
+  .board-wrapper {
+    margin-bottom: 12px;
+  }
+
+  /* Stack the lower interface rows clean vertically inside the action section dashboard box */
+  .controls {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    max-width: 100%;
+    padding: 10px;
+  }
 }
 </style>
