@@ -1,33 +1,39 @@
 <script setup>
-import { ref, onBeforeUnmount, computed, watch } from 'vue'
+import { ref, onBeforeUnmount, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Board from './Board.vue'
 import Tile from './Tile.vue'
-
-// Core Firebase Firestore imports
-import { doc, onSnapshot, setDoc, updateDoc, getDoc, arrayUnion, deleteDoc } from 'firebase/firestore'
-import { db } from '../firebase.js' 
+import { supabase, supabaseUrl, supabaseKey } from '../supabase.js' 
 
 const route = useRoute()
 const router = useRouter()
 
-// Reactive UI states
-const playerName = ref('')
+// Authentication & Profile States
+const currentUser = ref(null)
+const profileData = ref({ username: '', wins: 0, losses: 0 })
+const authEmail = ref('')
+const authPassword = ref('')
+const authUsername = ref('')
+const isSignUpMode = ref(false)
+const showProfileMenu = ref(false)
+const isLoadingProfile = ref(true) 
+const profileLoadError = ref(false)
+const isGuestMode = ref(false)
+const isSigningOut = ref(false)
+
+// UI Toggle States
 const inputRoomCode = ref('')
 const isJoined = ref(false)
 const errorMessage = ref('')
-const isMenuOpen = ref(false) 
-const showBingoNotification = ref(false) 
 const isProcessing = ref(false) 
+const isRoomLoading = ref(false)
 const loadingMessage = ref('')   
-const showForfeitModal = ref(false)
-const isReconnecting = ref(false)
-const reconnectAttempts = ref(0)
-const maxReconnectAttempts = ref(5)
-const showInvalidWordNotification = ref(false)
-const invalidWordMessage = ref('')
+const showForfeitModal = ref(false) 
+const showBingoNotification = ref(false)
+const isMenuOpen = ref(false)
+const playerName = ref('')
 
-// Core active game states
+// Core game structural matrices
 const boardFlat = ref(Array(225).fill(''))
 const latestPlayMessage = ref('') 
 const joinMessage = ref('')       
@@ -36,111 +42,299 @@ const currentPlayerIndex = ref(0)
 const selectedLetter = ref(null)
 const selectedRackIdx = ref(null) 
 const bag = ref([])
-const gameHistory = ref([]) 
-const matchResults = ref({ matchesPlayed: 0, wins: {} })
+const gameHistory = ref([])
 
-// Safe global variables to track drag states within Vue logic
-const activeDraggedTile = ref(null)
-const boardDragSourceIdx = ref(null) 
-
-const pendingMoves = ref([])
-
-let unsubscribeSnapshot = null
-let pingInterval = null
-let reconnectTimeout = null
 const room = ref('')
-const name = ref('')
+let gameChannel = null
+let gamePollInterval = null
+let gameDataLoaded = false
+const sessionGuestId = ref('guest-' + Math.random().toString(36).substring(2, 10))
 
-// Word validation API (using Free Dictionary API)
-async function validateWord(word) {
+// --- BACKEND DICTIONARY VALIDATION ENGINE ---
+async function validateWords(moves) {
+  const words = computeTurnWords(moves).map(positions => 
+    positions.map(p => p.letter).join('').toUpperCase()
+  )
+  
+  if (words.length === 0) return true
+
   try {
-    // Use a free dictionary API
-    const response = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${word.toLowerCase()}`)
-    return response.ok
-  } catch (error) {
-    console.error("Word validation error:", error)
-    // Fallback: accept the word if API fails
+    // Single network round-trip validating every word concurrently via RPC
+    const { data: invalidWords, error } = await supabase
+      .rpc('validate_words_list', { input_words: words })
+
+    if (error) throw error
+
+    if (invalidWords && invalidWords.length > 0) {
+      const badWord = invalidWords[0].invalid_word
+      errorMessage.value = `"${badWord}" is not a valid word!`
+      return false
+    }
+    
     return true
+  } catch (err) {
+    console.error('Dictionary backend verification failed:', err)
+    errorMessage.value = "Unable to verify words against server dictionary."
+    return false
   }
 }
 
-// Computed property combining database board with local uncommitted pending tiles
+// Check active session on load with timeout
+// Check active session on load with timeout
+onMounted(async () => {
+  document.addEventListener('click', handleOutsideClick)
+  
+  const loadTimeout = setTimeout(() => {
+    if (isLoadingProfile.value || isProcessing.value || isRoomLoading.value) {
+      console.warn('Profile loading timeout - proceeding with fallback')
+      isLoadingProfile.value = false
+      profileLoadError.value = false
+      isProcessing.value = false // Kill the processing spinner if it stalls out here
+      isRoomLoading.value = false
+      loadingMessage.value = ''
+      if (!currentUser.value) {
+        currentUser.value = null
+        isGuestMode.value = true
+        profileData.value = { username: 'Guest', wins: 0, losses: 0 }
+        playerName.value = 'Guest'
+      }
+    }
+  }, 3000)
+  
+  try {
+    localStorage.removeItem('scrabble_room')
+
+    const { data: { session }, error } = await supabase.auth.getSession()
+    clearTimeout(loadTimeout)
+    
+    if (session) {
+      await handleUserSessionFetch(session.user)
+    } else {
+      isLoadingProfile.value = false
+      isProcessing.value = false
+    }
+  } catch (err) {
+    clearTimeout(loadTimeout)
+    console.error('Session check error:', err)
+    isLoadingProfile.value = false
+    isProcessing.value = false
+    profileData.value = { username: 'Guest', wins: 0, losses: 0 }
+  }
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('click', handleOutsideClick)
+  stopGamePolling()
+})
+
+function handleOutsideClick(event) {
+  const profileMenu = document.querySelector('.profile-dropdown')
+  const userInfo = document.querySelector('.user-info')
+  if (profileMenu && userInfo && !profileMenu.contains(event.target) && !userInfo.contains(event.target)) {
+    showProfileMenu.value = false
+  }
+}
+
+supabase.auth.onAuthStateChange(async (event, session) => {
+  if (event === 'SIGNED_IN' && session) {
+    await handleUserSessionFetch(session.user)
+  } else if (event === 'SIGNED_OUT' && !session) {
+    currentUser.value = null
+    isGuestMode.value = false
+    profileData.value = { username: '', wins: 0, losses: 0 }
+    authUsername.value = ''
+    isLoadingProfile.value = false
+    showProfileMenu.value = false
+    resetLocalState()
+  }
+})
+
+async function handleUserSessionFetch(user) {
+  if (!user) {
+    isLoadingProfile.value = false
+    profileLoadError.value = false
+    isProcessing.value = false
+    return
+  }
+  
+  currentUser.value = user
+  
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .single()
+    
+    if (!error && data) {
+      profileData.value = data
+      authUsername.value = ''
+    } else if (error && error.code === 'PGRST116') {
+      const username = authUsername.value || user.id.slice(0, 8)
+      
+      const { data: newProfile, error: insertError } = await supabase
+        .from('profiles')
+        .insert({
+          id: user.id,
+          username: username,
+          wins: 0,
+          losses: 0
+        })
+        .select()
+        .single()
+      
+      if (newProfile && !insertError) {
+        profileData.value = newProfile
+        authUsername.value = ''
+      } else {
+        throw insertError || new Error('Failed to create profile')
+      }
+    } else {
+      throw error
+    }
+  } catch (err) {
+    console.error('Profile error:', err)
+    profileData.value = {
+      id: user.id,
+      username: authUsername.value || user.id.slice(0, 8) || 'Player',
+      wins: 0,
+      losses: 0
+    }
+    authUsername.value = ''
+  } finally {
+    // Unconditionally release ALL login blockades
+    isLoadingProfile.value = false
+    profileLoadError.value = false
+    isProcessing.value = false 
+  }
+}
+
+async function handleAuthAction() {
+  if (!authEmail.value || !authPassword.value) {
+    errorMessage.value = "Please fill in email and password lines."
+    return
+  }
+  errorMessage.value = ""
+  isProcessing.value = true
+  
+  try {
+    if (isSignUpMode.value) {
+      if (!authUsername.value.trim()) {
+        errorMessage.value = "Username is required!"
+        isProcessing.value = false
+        return
+      }
+      
+      const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+        email: authEmail.value,
+        password: authPassword.value,
+        options: {
+          data: { username: authUsername.value.trim() }
+        }
+      })
+      if (signUpError) throw signUpError
+      
+      if (signUpData.user) {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        await handleUserSessionFetch(signUpData.user)
+      }
+    } else {
+      const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+        email: authEmail.value,
+        password: authPassword.value
+      })
+      if (signInError) throw signInError
+      if (signInData.user) {
+        await handleUserSessionFetch(signInData.user)
+      }
+    }
+  } catch (err) {
+    console.error("Authentication process caught error:", err)
+    errorMessage.value = err.message || "An unexpected auth execution drop occurred."
+    
+    // CRITICAL FIXES FOR HANGING SPINNER:
+    isLoadingProfile.value = false 
+    isRoomLoading.value = false
+    loadingMessage.value = ''
+  } finally {
+    // THIS GUARANTEES THE "PROCESSING" SPINNER DISAPPEARS
+    isProcessing.value = false
+    isLoadingProfile.value = false
+    isRoomLoading.value = false
+    loadingMessage.value = ''
+  }
+}
+
+function signInAsGuest() {
+  isGuestMode.value = true
+  currentUser.value = null
+  profileData.value = { username: 'Guest', wins: 0, losses: 0 }
+  isLoadingProfile.value = false
+  errorMessage.value = ''
+}
+
+async function handleLogout() {
+  isSigningOut.value = true
+  showProfileMenu.value = false
+  try {
+    await new Promise(resolve => setTimeout(resolve, 800))
+    if (currentUser.value) {
+      const { error } = await supabase.auth.signOut()
+      if (error) throw error
+    }
+  } catch (err) {
+    console.error('Logout error:', err)
+  } finally {
+    isSigningOut.value = false
+  }
+  currentUser.value = null
+  isGuestMode.value = false
+  profileData.value = { username: '', wins: 0, losses: 0 }
+  authUsername.value = ''
+  resetLocalState()
+  showProfileMenu.value = false
+}
+
+function toggleProfileMenu() {
+  showProfileMenu.value = !showProfileMenu.value
+}
+
+function hasValidMove(rack, board) {
+  return rack.length > 0 && board.some(cell => cell !== '')
+}
+
+async function isGameOver(playersList, currentBag, currentBoard) {
+  if (currentBag.length === 0 && playersList.some(p => p.rack.length === 0)) return true
+  
+  for (const player of playersList) {
+    if (hasValidMove(player.rack, currentBoard)) return false
+  }
+  return true
+}
+
+// --- SCRABBLE ENGINE ---
 const board2D = computed(() => {
   const grid = []
   const currentBoard = [...boardFlat.value]
-  
   pendingMoves.value.forEach(move => {
-    const idx = move.r * 15 + move.c
-    currentBoard[idx] = move.letter
+    const flatIndex = move.r * 15 + move.c
+    if (flatIndex >= 0 && flatIndex < 225) {
+      currentBoard[flatIndex] = move.letter
+    }
   })
-
   for (let i = 0; i < 15; i++) {
     grid.push(currentBoard.slice(i * 15, (i + 1) * 15))
   }
   return grid
 })
 
-// Official Scrabble Letter Distributions and Scores
 const LETTER_SCORES = {
   A:1, B:3, C:3, D:2, E:1, F:4, G:2, H:4, I:1, J:8, K:5, L:1, M:3,
   N:1, O:1, P:3, Q:10, R:1, S:1, T:1, U:1, V:4, W:4, X:8, Y:4, Z:10
 }
-
 const LETTER_COUNTS = {
   A:9, B:2, C:2, D:4, E:12, F:2, G:3, H:2, I:9, J:1, K:1, L:4, M:2,
   N:6, O:8, P:2, Q:1, R:6, S:4, T:6, U:4, V:2, W:2, X:1, Y:2, Z:1
-}
-
-function createOfficialBag() {
-  const fullBag = []
-  for (const [letter, count] of Object.entries(LETTER_COUNTS)) {
-    for (let i = 0; i < count; i++) {
-      fullBag.push({ letter, pts: LETTER_SCORES[letter] })
-    }
-  }
-  for (let i = fullBag.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[fullBag[i], fullBag[j]] = [fullBag[j], fullBag[i]]
-  }
-  return fullBag
-}
-
-function hasTwoLetterWord(tiles) {
-  const letters = tiles.map(t => t.letter)
-  for (let i = 0; i < letters.length; i++) {
-    for (let j = 0; j < letters.length; j++) {
-      if (i === j) continue
-      if (VALID_2_LETTER_WORDS.has(letters[i] + letters[j])) return true
-    }
-  }
-  return false
-}
-
-const VALID_2_LETTER_WORDS = new Set([
-  'AA', 'AB', 'AD', 'AE', 'AG', 'AH', 'AI', 'AL', 'AM', 'AN', 'AR', 'AS', 'AT', 'AW', 'AX', 'AY',
-  'BA', 'BE', 'BI', 'BO', 'BY', 'DA', 'DE', 'DO', 'ED', 'EF', 'EH', 'EL', 'EM', 'EN', 'ER', 'ES',
-  'ET', 'EX', 'FA', 'FE', 'GI', 'GO', 'HA', 'HE', 'HI', 'HM', 'HO', 'ID', 'IF', 'IN', 'IS', 'IT',
-  'JO', 'KA', 'KI', 'LA', 'LI', 'LO', 'MA', 'ME', 'MI', 'MM', 'MO', 'MU', 'MY', 'NA', 'NE', 'NO',
-  'NU', 'OD', 'OE', 'OF', 'OH', 'OI', 'OK', 'OM', 'ON', 'OP', 'OR', 'OS', 'OU', 'OW', 'OX', 'OY',
-  'PA', 'PE', 'PI', 'PO', 'QI', 'RE', 'SH', 'SI', 'SO', 'TA', 'TE', 'TI', 'TO', 'UH', 'UM', 'UN',
-  'UP', 'US', 'UT', 'WE', 'WO', 'XI', 'XU', 'YA', 'YE', 'YO', 'ZA'
-])
-
-function drawSmartTiles(targetBag, count) {
-  let drawn = []
-  for (let i = 0; i < Math.min(count, targetBag.length); i++) {
-    drawn.push(targetBag.pop())
-  }
-  if (count === 7 && Math.random() < 0.80) {
-    let attempts = 0
-    while (!hasTwoLetterWord(drawn) && targetBag.length > 3 && attempts < 15) {
-      attempts++
-      const returnTile = drawn.pop()
-      targetBag.unshift(returnTile)
-      drawn.push(targetBag.pop())
-    }
-  }
-  return drawn
 }
 
 const TILE_MULTIPLIERS = (() => {
@@ -163,6 +357,38 @@ function tileMultiplierAt(r, c) {
   if (type === 'TL') return { letter: 3, word: 1 }
   if (type === 'DL') return { letter: 2, word: 1 }
   return { letter: 1, word: 1 }
+}
+
+function createOfficialBag() {
+  const fullBag = []
+  for (const [letter, count] of Object.entries(LETTER_COUNTS)) {
+    for (let i = 0; i < count; i++) fullBag.push({ letter, pts: LETTER_SCORES[letter] })
+  }
+  for (let i = fullBag.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[fullBag[i], fullBag[j]] = [fullBag[j], fullBag[i]]
+  }
+  return fullBag
+}
+
+function hasTwoLetterWord(tiles) {
+  const letters = tiles.map(t => t.letter)
+  for (let i = 0; i < letters.length; i++) {
+    for (let j = 0; j < letters.length; j++) {
+      if (i === j) continue
+      // Standard 2-letter validation fallback dictionary reference array removed since RPC is active
+      return true
+    }
+  }
+  return false
+}
+
+function drawSmartTiles(targetBag, count) {
+  let drawn = []
+  for (let i = 0; i < Math.min(count, targetBag.length); i++) {
+    drawn.push(targetBag.pop())
+  }
+  return drawn
 }
 
 function getBoardLetter(r, c, pendingMap = {}) {
@@ -239,447 +465,34 @@ function calculateScrabbleTurnScore(moves) {
   return score
 }
 
-function getTurnWordsList(moves) {
-  const words = computeTurnWords(moves).map(positions => positions.map(p => p.letter).join(''))
-  return words
-}
-
 function getTurnWordDescription(moves) {
-  const words = getTurnWordsList(moves)
+  const words = computeTurnWords(moves).map(positions => positions.map(p => p.letter).join(''))
   if (!words.length) return ''
   if (words.length === 1) return words[0]
   return words.join(', ')
 }
 
-function generateRoomCode() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-  let result = ''
-  for (let i = 0; i < 6; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length))
+function addToHistory(playerName, action, details, scoreChange = null) {
+  const historyEntry = {
+    id: gameHistory.value.length,
+    timestamp: new Date(),
+    playerName,
+    action,
+    details,
+    scoreChange: scoreChange,
+    turnNumber: gameHistory.value.filter(h => h.action === 'played').length + 1
   }
-  return result
-}
-
-async function updateLastActive(roomRef) {
-  try {
-    await updateDoc(roomRef, {
-      lastActive: Date.now()
-    })
-  } catch (err) {
-    // Silently fail - not critical
+  gameHistory.value.push(historyEntry)
+  
+  if (gameHistory.value.length > 50) {
+    gameHistory.value.shift()
   }
 }
 
-function startPingInterval() {
-  if (pingInterval) clearInterval(pingInterval)
-  pingInterval = setInterval(async () => {
-    if (room.value && isJoined.value) {
-      const roomRef = doc(db, 'rooms', room.value)
-      await updateLastActive(roomRef)
-    }
-  }, 30000) // Every 30 seconds
-}
-
-async function handleReconnection(roomCode) {
-  if (reconnectAttempts.value >= maxReconnectAttempts.value) {
-    alert("Unable to reconnect to game room. The room may have expired.")
-    resetLocalState()
-    localStorage.removeItem('scrabble_roomCode')
-    localStorage.removeItem('scrabble_playerName')
-    localStorage.removeItem('scrabble_reconnecting')
-    isReconnecting.value = false
-    isProcessing.value = false
-    return
-  }
-  
-  isReconnecting.value = true
-  reconnectAttempts.value++
-  localStorage.setItem('scrabble_reconnecting', 'true')
-  loadingMessage.value = `Reconnecting to game... (Attempt ${reconnectAttempts.value}/${maxReconnectAttempts.value})`
-  
-  // Wait before retry
-  await new Promise(resolve => setTimeout(resolve, 2000))
-  
-  const roomRef = doc(db, 'rooms', roomCode)
-  try {
-    const docSnap = await getDoc(roomRef)
-    if (docSnap.exists()) {
-      // Room still exists, restart listener
-      startFirebaseListener(roomCode, true)
-    } else {
-      // Room doesn't exist, try again
-      handleReconnection(roomCode)
-    }
-  } catch (err) {
-    handleReconnection(roomCode)
-  }
-}
-
-function startFirebaseListener(roomCode, isReconnect = false) {
-  if (unsubscribeSnapshot) unsubscribeSnapshot()
-  const roomRef = doc(db, 'rooms', roomCode)
-  
-  // Store in localStorage for refresh recovery
-  localStorage.setItem('scrabble_roomCode', roomCode)
-  localStorage.setItem('scrabble_playerName', name.value)
-  
-  // Show loader while connecting/reconnecting
-  if (isReconnect) {
-    isReconnecting.value = true
-    loadingMessage.value = "Connected! Loading game state..."
-  } else {
-    isProcessing.value = true
-    loadingMessage.value = "Loading game..."
-  }
-  
-  unsubscribeSnapshot = onSnapshot(roomRef, (docSnap) => {
-    if (!docSnap.exists()) {
-      if (isJoined.value) {
-        // Try to reconnect if room exists but we lost connection
-        handleReconnection(roomCode)
-      }
-      return
-    }
-    
-    // Successfully connected - hide loaders
-    setTimeout(() => {
-      isReconnecting.value = false
-      isProcessing.value = false
-      reconnectAttempts.value = 0
-    }, 500)
-    
-    localStorage.removeItem('scrabble_reconnecting')
-    
-    const data = docSnap.data()
-    boardFlat.value = data.boardFlat || Array(225).fill('')
-    bag.value = data.bag || []
-    players.value = data.players || []
-    currentPlayerIndex.value = data.currentPlayer ?? 0
-    joinMessage.value = data.joinNotification || ''
-    latestPlayMessage.value = data.latestPlay || ''
-    gameHistory.value = data.gameHistory || []
-    matchResults.value = data.matchResults || { matchesPlayed: 0, wins: {} }
-    
-    // Clear any pending moves when reconnecting
-    if (isReconnect) {
-      pendingMoves.value = []
-      selectedLetter.value = null
-      selectedRackIdx.value = null
-    }
-    
-    // Update last active time
-    updateLastActive(roomRef)
-  }, (error) => {
-    console.error("Snapshot error:", error)
-    if (!isReconnecting.value && isJoined.value) {
-      handleReconnection(roomCode)
-    } else {
-      isProcessing.value = false
-      isReconnecting.value = false
-    }
-  })
-  
-  startPingInterval()
-}
-
-function checkForExistingGame() {
-  const savedRoomCode = localStorage.getItem('scrabble_roomCode')
-  const savedPlayerName = localStorage.getItem('scrabble_playerName')
-  
-  if (savedRoomCode && savedPlayerName) {
-    playerName.value = savedPlayerName
-    inputRoomCode.value = savedRoomCode
-    isReconnecting.value = true
-    loadingMessage.value = "Reconnecting to your game..."
-    isProcessing.value = true
-    
-    // Attempt to rejoin after a short delay
-    setTimeout(() => {
-      handleJoinRoom(true)
-    }, 500)
-  }
-}
-
-async function handleCreateRoom() {
-  if (!playerName.value.trim()) {
-    errorMessage.value = "Please enter your name first!"
-    return
-  }
-  
-  errorMessage.value = ""
-  isProcessing.value = true
-  loadingMessage.value = "Creating room..."
-  
-  // Clear any existing reconnect data
-  localStorage.removeItem('scrabble_roomCode')
-  localStorage.removeItem('scrabble_playerName')
-  localStorage.removeItem('scrabble_reconnecting')
-  isReconnecting.value = false
-  reconnectAttempts.value = 0
-  
-  const newRoomCode = generateRoomCode()
-  const roomRef = doc(db, 'rooms', newRoomCode)
-  const freshBag = createOfficialBag()
-  const initialRack = drawSmartTiles(freshBag, 7)
-  const expiryTimestamp = Date.now() + (24 * 60 * 60 * 1000)
-  
-  const initialData = {
-    boardFlat: Array(225).fill(''),
-    bag: freshBag,
-    players: [{ name: playerName.value.trim(), rack: initialRack, score: 0 }],
-    currentPlayer: 0,
-    joinNotification: `Room ${newRoomCode} created by ${playerName.value.trim()}`,
-    latestPlay: '',
-    gameHistory: [],
-    matchResults: { matchesPlayed: 0, wins: {} },
-    expiresAt: expiryTimestamp,
-    lastActive: Date.now()
-  }
-  
-  try {
-    await setDoc(roomRef, initialData)
-    room.value = newRoomCode
-    name.value = playerName.value.trim()
-    isJoined.value = true
-    startFirebaseListener(newRoomCode)
-  } catch (err) {
-    errorMessage.value = "Failed to create room."
-    console.error(err)
-    isProcessing.value = false
-  }
-}
-
-async function handleJoinRoom(isAutoReconnect = false) {
-  const code = isAutoReconnect ? inputRoomCode.value : inputRoomCode.value.trim().toUpperCase()
-  const enteredName = isAutoReconnect ? playerName.value : playerName.value.trim()
-  
-  if (!enteredName) {
-    errorMessage.value = "Please enter your name!"
-    return
-  }
-  if (!code) {
-    errorMessage.value = "Please enter a room code!"
-    return
-  }
-  
-  if (!isAutoReconnect) {
-    errorMessage.value = ""
-    isProcessing.value = true
-    loadingMessage.value = "Joining room..."
-  }
-  
-  // Clear any existing reconnect data if not auto reconnect
-  if (!isAutoReconnect) {
-    localStorage.removeItem('scrabble_reconnecting')
-    isReconnecting.value = false
-    reconnectAttempts.value = 0
-  }
-  
-  const roomRef = doc(db, 'rooms', code)
-  
-  try {
-    const docSnap = await getDoc(roomRef)
-    if (!docSnap.exists()) {
-      errorMessage.value = "Room code not found!"
-      isProcessing.value = false
-      isReconnecting.value = false
-      return
-    }
-    
-    const data = docSnap.data()
-    const existingPlayerIndex = data.players.findIndex(p => p.name.toLowerCase() === enteredName.toLowerCase())
-    
-    if (existingPlayerIndex !== -1) {
-      room.value = code
-      name.value = data.players[existingPlayerIndex].name 
-      isJoined.value = true
-      startFirebaseListener(code, isAutoReconnect)
-      return
-    }
-    
-    if (data.players.length >= 2) {
-      errorMessage.value = "This room is full."
-      isProcessing.value = false
-      isReconnecting.value = false
-      return
-    }
-    
-    const currentBag = [...data.bag]
-    const startingRack = drawSmartTiles(currentBag, 7)
-    const updatedPlayers = [...data.players, { name: enteredName, rack: startingRack, score: 0 }]
-    const updatedJoinLog = `${enteredName} joined the room.`
-    
-    await updateDoc(roomRef, {
-      players: updatedPlayers,
-      bag: currentBag,
-      joinNotification: updatedJoinLog,
-      lastActive: Date.now(),
-      expiresAt: Date.now() + (24 * 60 * 60 * 1000)
-    })
-
-    room.value = code
-    name.value = enteredName
-    isJoined.value = true
-    startFirebaseListener(code, isAutoReconnect)
-  } catch (err) {
-    errorMessage.value = "Error connecting to room."
-    console.error(err)
-    isProcessing.value = false
-    isReconnecting.value = false
-  }
-}
-
-function resetLocalState() {
-  if (unsubscribeSnapshot) unsubscribeSnapshot()
-  if (pingInterval) clearInterval(pingInterval)
-  if (reconnectTimeout) clearTimeout(reconnectTimeout)
-  isJoined.value = false
-  room.value = ''
-  name.value = ''
-  pendingMoves.value = []
-  boardFlat.value = Array(225).fill('')
-  bag.value = []
-  players.value = []
-  isReconnecting.value = false
-  reconnectAttempts.value = 0
-  isProcessing.value = false
-  localStorage.removeItem('scrabble_roomCode')
-  localStorage.removeItem('scrabble_playerName')
-  localStorage.removeItem('scrabble_reconnecting')
-}
-
-function triggerForfeitConfirmation() {
-  isMenuOpen.value = false
-  showForfeitModal.value = true
-}
-
-function cancelForfeit() {
-  showForfeitModal.value = false
-}
-
-async function confirmForfeit() {
-  showForfeitModal.value = false
-  if (!room.value) return
-
-  isProcessing.value = true
-  loadingMessage.value = "Processing forfeit..."
-
-  const roomRef = doc(db, 'rooms', room.value)
-  
-  try {
-    const opp = players.value.find(p => p.name.toLowerCase() !== name.value.toLowerCase())
-    
-    if (opp) {
-      const summaryLog = `Match ended: ${name.value} forfeited. ${opp.name} is awarded the victory!`
-      await updateDoc(roomRef, {
-        currentPlayer: -1,
-        latestPlay: summaryLog,
-        gameHistory: arrayUnion(summaryLog)
-      })
-      await new Promise(r => setTimeout(r, 1000))
-    }
-
-    await deleteDoc(roomRef)
-  } catch (err) {
-    console.error("Forfeit submission error: ", err)
-  } finally {
-    isProcessing.value = false
-    resetLocalState()
-  }
-}
-
-function showInvalidWordNotificationMsg(words) {
-  invalidWordMessage.value = `Invalid word(s): ${words.join(', ')}. Please try again!`
-  showInvalidWordNotification.value = true
-  setTimeout(() => {
-    showInvalidWordNotification.value = false
-  }, 3000)
-}
-
-watch(latestPlayMessage, (newMsg) => {
-  if (newMsg && newMsg.includes("BINGO!")) {
-    showBingoNotification.value = true
-    setTimeout(() => {
-      showBingoNotification.value = false
-    }, 2000)
-  }
-})
-
-onBeforeUnmount(() => {
-  if (unsubscribeSnapshot) unsubscribeSnapshot()
-  if (pingInterval) clearInterval(pingInterval)
-  if (reconnectTimeout) clearTimeout(reconnectTimeout)
-})
-
-// Check for existing game on mount
-checkForExistingGame()
-
-const localPlayerIndex = computed(() => {
-  return players.value.findIndex(p => p.name.toLowerCase() === name.value.toLowerCase())
-})
-
-const isMyTurn = computed(() => {
-  return players.value.length === 2 && localPlayerIndex.value !== -1 && localPlayerIndex.value === currentPlayerIndex.value
-})
-
-const myRack = computed(() => {
-  const me = players.value[localPlayerIndex.value]
-  if (!me) return []
-  
-  let workingRack = me.rack.map((t, index) => ({ ...t, rackId: index }))
-  
-  pendingMoves.value.forEach(move => {
-    const idx = workingRack.findIndex(t => t.rackId === move.rackId)
-    if (idx >= 0) workingRack.splice(idx, 1)
-  })
-  return workingRack
-})
-
-function handleDrop({ r, c }) {
-  const sourceTile = activeDraggedTile.value || { letter: selectedLetter.value, rackId: selectedRackIdx.value }
-  const flatIndex = r * 15 + c
-  if (!sourceTile.letter || !isMyTurn.value || boardFlat.value[flatIndex] !== '') return
-
-  if (boardDragSourceIdx.value !== null) {
-    pendingMoves.value.splice(boardDragSourceIdx.value, 1)
-    boardDragSourceIdx.value = null
-  }
-
-  const destOverlap = pendingMoves.value.findIndex(m => m.r === r && m.c === c)
-  if (destOverlap !== -1) {
-    pendingMoves.value.splice(destOverlap, 1)
-  }
-
-  const sourceIdx = pendingMoves.value.findIndex(m => m.rackId === sourceTile.rackId)
-  if (sourceIdx !== -1) {
-    pendingMoves.value.splice(sourceIdx, 1)
-  }
-
-  pendingMoves.value.push({ r, c, letter: sourceTile.letter, rackId: sourceTile.rackId })
-}
-
-function onBoardTileDragStart(e, moveItem) {
-  if (!isMyTurn.value) return
-  
-  const foundMoveIdx = pendingMoves.value.findIndex(m => m.r === moveItem.r && m.c === moveItem.c)
-  let assignedRackId = moveItem.rackId
-
-  if (foundMoveIdx !== -1) {
-    assignedRackId = pendingMoves.value[foundMoveIdx].rackId
-    boardDragSourceIdx.value = foundMoveIdx
-  }
-
-  activeDraggedTile.value = { letter: moveItem.letter, rackId: assignedRackId }
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move'
-    e.dataTransfer.setData('text/plain', 'board_tile')
-  }
-}
-
-if (typeof window !== 'undefined') {
-  window.addEventListener('dragover', (e) => { e.preventDefault() }, { passive: false })
-  window.addEventListener('drop', (e) => { e.preventDefault() }, { passive: false })
-}
+// --- DRAG, DROP AND PLACEMENT HANDLERS ---
+const activeDraggedTile = ref(null)
+const boardDragSourceIdx = ref(null) 
+const pendingMoves = ref([])
 
 function validatePlacement() {
   if (pendingMoves.value.length === 0) return false
@@ -688,7 +501,7 @@ function validatePlacement() {
   const allSameCol = pendingMoves.value.every(m => m.c === firstMove.c)
   
   if (!allSameRow && !allSameCol) {
-    alert("Invalid placement! Tiles must be arranged in a straight line.")
+    errorMessage.value = "Invalid placement! Tiles must be arranged in a straight line."
     return false
   }
 
@@ -696,7 +509,11 @@ function validatePlacement() {
   if (isFirstMoveOfGame) {
     const hitsCenter = pendingMoves.value.some(m => m.r === 7 && m.c === 7)
     if (!hitsCenter) {
-      alert("The first word must pass through the center tile (Row 8, Column 8)!")
+      errorMessage.value = "The first word must pass through the center tile (Row 8, Column 8)!"
+      return false
+    }
+    if (pendingMoves.value.length < 2) {
+      errorMessage.value = "The first word must have at least 2 tiles."
       return false
     }
     return true
@@ -720,112 +537,511 @@ function validatePlacement() {
   }
 
   if (!touchesExistingTile) {
-    alert("Your word must touch an existing letter already on the board.")
+    errorMessage.value = "Your word must touch an existing letter already on the board."
     return false
   }
   return true
 }
 
-async function confirmTurn() {
-  if (!isMyTurn.value || pendingMoves.value.length === 0) return
-  if (!validatePlacement()) return
-
-  // Validate words before submitting
-  const wordsToValidate = getTurnWordsList(pendingMoves.value)
-  const validationResults = await Promise.all(wordsToValidate.map(word => validateWord(word)))
-  
-  const invalidWords = wordsToValidate.filter((word, index) => !validationResults[index])
-  
-  if (invalidWords.length > 0) {
-    showInvalidWordNotificationMsg(invalidWords)
-    return
-  }
-
-  const roomRef = doc(db, 'rooms', room.value)
-  const updatedBoardFlat = [...boardFlat.value]
-  const updatedPlayers = JSON.parse(JSON.stringify(players.value))
-  const updatedBag = [...bag.value]
-  const activePlayer = updatedPlayers[localPlayerIndex.value]
-
-  const turnScore = calculateScrabbleTurnScore(pendingMoves.value)
-  const sorted = [...pendingMoves.value].sort((a, b) => a.r !== b.r ? a.r - b.r : a.c - b.c)
-  
-  const rackIndicesToRemove = sorted.map(m => m.rackId).filter(id => id !== undefined)
-  
-  sorted.forEach(move => {
-    const idx = move.r * 15 + move.c
-    updatedBoardFlat[idx] = move.letter
-  });
-  
-  activePlayer.rack = activePlayer.rack.filter((_, idx) => !rackIndicesToRemove.includes(idx))
-  activePlayer.score += turnScore
-
-  const needed = 7 - activePlayer.rack.length
-  if (needed > 0 && updatedBag.length > 0) {
-    const replacements = drawSmartTiles(updatedBag, needed)
-    activePlayer.rack.push(...replacements)
-  }
-
-  const wordDescription = getTurnWordDescription(pendingMoves.value)
-  const isBingo = pendingMoves.value.length === 7
-  
-  const plainWordScore = isBingo ? (turnScore - 50) : turnScore
-  const newPlayLog = `${name.value} played "${wordDescription}" (+${plainWordScore} pts)${isBingo ? " (BINGO! +50 pts)" : ""}`
-  
-  const nextPlayerIndex = (currentPlayerIndex.value + 1) % updatedPlayers.length
-  const shouldEndMatch = updatedBag.length === 0 && updatedPlayers.some(p => p.rack.length === 0)
-
+function recallTiles() {
   pendingMoves.value = []
-
-  await updateDoc(roomRef, {
-    boardFlat: updatedBoardFlat,
-    bag: updatedBag,
-    players: updatedPlayers,
-    currentPlayer: shouldEndMatch ? -1 : nextPlayerIndex,
-    latestPlay: shouldEndMatch ? '' : newPlayLog,
-    lastActive: Date.now(),
-    expiresAt: Date.now() + (24 * 60 * 60 * 1000)
-  })
+  errorMessage.value = ''
 }
 
+function promiseTimeout(ms, promise) {
+  let timeoutId
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`Request timed out after ${ms}ms`)), ms)
+  })
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId))
+}
+
+async function rawInsertGame(gameData) {
+  const url = `${supabaseUrl}/rest/v1/games`
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      apikey: supabaseKey,
+      Authorization: `Bearer ${supabaseKey}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation'
+    },
+    body: JSON.stringify([gameData])
+  })
+
+  const text = await response.text()
+  let json
+  try {
+    json = text ? JSON.parse(text) : null
+  } catch (err) {
+    throw new Error(`Raw insert parse failed: ${text}`)
+  }
+
+  if (!response.ok) {
+    throw new Error(`Raw insert failed (${response.status}): ${JSON.stringify(json)}`)
+  }
+
+  return Array.isArray(json) ? json[0] : json
+}
+
+async function findExistingRoom(roomCode) {
+  const { data, error } = await promiseTimeout(8000, supabase
+    .from('games')
+    .select('*')
+    .eq('room_code', roomCode)
+    .maybeSingle())
+
+  if (error && error.code !== 'PGRST116') {
+    throw error
+  }
+
+  return data
+}
+
+// --- SUPABASE GAME EXECUTION ---
+async function handleCreateRoom() {
+  console.log('handleCreateRoom called', { playerName: playerName.value, isLoadingProfile: isLoadingProfile.value })
+  if (isLoadingProfile.value) {
+    errorMessage.value = "Still loading your profile. Please wait a moment..."
+    return
+  }
+  
+  if (!playerName.value.trim()) {
+    errorMessage.value = "Please enter your name first!"
+    return
+  }
+  
+  errorMessage.value = ""
+  isRoomLoading.value = true
+  loadingMessage.value = "Creating game room..."
+  
+  const newRoomCode = Math.random().toString(36).substring(2, 8).padEnd(6, '0').toUpperCase()
+  const freshBag = createOfficialBag()
+  const initialRack = drawSmartTiles([...freshBag], 7)
+  const username = playerName.value.trim()
+  
+  try {
+    console.log('handleCreateRoom inserting game', { newRoomCode, playerName: username, currentUser: currentUser.value, profileUsername: profileData.value.username })
+    if (currentUser.value && (!profileData.value.username || profileData.value.username === 'Guest')) {
+      await supabase
+        .from('profiles')
+        .update({ username })
+        .eq('id', currentUser.value.id)
+      profileData.value.username = username
+    }
+
+    const gameData = {
+      room_code: newRoomCode,
+      board_state: Array(225).fill(''),
+      tile_bag: freshBag,
+      players_json: [{ 
+        id: currentUser.value?.id || sessionGuestId.value, 
+        name: username, 
+        rack: initialRack, 
+        score: 0 
+      }],
+      status: 'pending',
+      current_turn_name: username,
+      latest_play: '',
+      host_id: currentUser.value?.id || null,
+      created_at: new Date().toISOString()
+    }
+    console.log('Game insert payload', gameData)
+
+    const fallbackRow = await rawInsertGame(gameData)
+const insertData = [fallbackRow]
+room.value = newRoomCode
+isJoined.value = true
+gameDataLoaded = false
+addToHistory(username, 'game_started', 'Game created', null)
+
+console.log('About to start subscription for', newRoomCode)
+    console.log('Game created successfully, updating local room state', { newRoomCode, insertData })
+    room.value = newRoomCode
+    isJoined.value = true
+    gameDataLoaded = false
+    addToHistory(username, 'game_started', 'Game created', null)
+    await startSupabaseSubscription(newRoomCode, fallbackRow) 
+console.log('Subscription promise resolved for', newRoomCode)
+    console.log('Subscription promise resolved for', newRoomCode)
+    
+  } catch (err) {
+    console.error('Create room error:', err)
+    errorMessage.value = "Failed to create game room. Please try again."
+  } finally {
+    isRoomLoading.value = false
+    loadingMessage.value = ''
+  }
+}
+
+async function handleJoinRoom() {
+  const code = inputRoomCode.value.trim().toUpperCase()
+  
+  if (!playerName.value.trim()) {
+    errorMessage.value = "Please enter your name first!"
+    return
+  }
+  
+  if (!code) {
+    errorMessage.value = "Please enter a room code!"
+    return
+  }
+  
+  errorMessage.value = ""
+  isRoomLoading.value = true
+  loadingMessage.value = "Joining game room..."
+  
+  try {
+    const { data: gameData, error: fetchError } = await supabase
+      .from('games')
+      .select('*')
+      .eq('room_code', code)
+      .single()
+
+    if (fetchError && fetchError.code !== 'PGRST116') throw fetchError
+    
+    if (!gameData) {
+      errorMessage.value = "Room code not found!"
+      return
+    }
+    
+    let currentPlayers = [...(gameData.players_json || [])]
+    const username = playerName.value.trim()
+    const currentUserId = currentUser.value?.id || sessionGuestId.value
+    const alreadyIn = currentPlayers.some(p => p.id === currentUserId)
+    
+    if (alreadyIn) {
+      room.value = code
+      isJoined.value = true
+      gameDataLoaded = false
+      profileData.value.username = currentPlayers.find(p => p.id === currentUserId).name
+      addToHistory(profileData.value.username, 'reconnected', `${profileData.value.username} reconnected`, null)
+      await startSupabaseSubscription(code)
+      return
+    }
+    
+    if (currentPlayers.length >= 2) {
+      errorMessage.value = "This match room is full."
+      return
+    }
+    
+    let currentBag = [...(gameData.tile_bag || [])]
+    const startingRack = drawSmartTiles(currentBag, 7)
+    currentPlayers.push({ 
+      id: currentUserId, 
+      name: username, 
+      rack: startingRack, 
+      score: 0 
+    })
+    
+    if (currentUser.value && (!profileData.value.username || profileData.value.username === 'Guest')) {
+      await supabase
+        .from('profiles')
+        .update({ username })
+        .eq('id', currentUser.value.id)
+      profileData.value.username = username
+    }
+    
+    const { error: updateError } = await supabase
+      .from('games')
+      .update({
+        players_json: currentPlayers,
+        tile_bag: currentBag,
+        guest_id: currentUserId,
+        status: 'active',
+        join_notification: `${username} has joined!`,
+        updated_at: new Date().toISOString()
+      })
+      .eq('room_code', code)
+
+    if (updateError) throw updateError
+
+    room.value = code
+    isJoined.value = true
+    gameDataLoaded = false
+    addToHistory(username, 'joined', `${username} joined the game`, null)
+    await startSupabaseSubscription(code)
+    
+  } catch (err) {
+    console.error('Join room error:', err)
+    errorMessage.value = "Failed to join room. Please try again."
+  } finally {
+    isRoomLoading.value = false
+    loadingMessage.value = ''
+  }
+}
+
+function stopGamePolling() {
+  if (gamePollInterval) {
+    clearInterval(gamePollInterval)
+    gamePollInterval = null
+  }
+}
+
+function startGamePolling(roomCode) {
+  if (gamePollInterval) return
+  console.warn('Starting fallback polling for room state because realtime may be unavailable.', roomCode)
+  gamePollInterval = setInterval(async () => {
+    try {
+      const data = await findExistingRoom(roomCode)
+      if (data) {
+        console.log('Fallback poll loaded game state for', roomCode)
+        syncStateMap(data)
+      }
+    } catch (pollErr) {
+      console.warn('Fallback poll error for room', roomCode, pollErr)
+    }
+  }, 5000)
+}
+
+async function startSupabaseSubscription(roomCode, initialData = null) {
+  console.log('startSupabaseSubscription called for', roomCode)
+  stopGamePolling()
+
+  if (gameChannel) {
+    try {
+      await supabase.removeChannel(gameChannel)
+    } catch (e) {
+      console.warn('Error removing channel:', e)
+    }
+    gameChannel = null
+  }
+  
+  // 1. THIS IS THE TRY BLOCK THAT WAS OPENED
+  try {
+    let data = initialData
+    
+    if (!data) {
+      const response = await promiseTimeout(5000, supabase
+        .from('games')
+        .select('*')
+        .eq('room_code', roomCode)
+        .single())
+        
+      data = response.data
+      const error = response.error
+      console.log('Subscription initial game fetch', { roomCode, data, error })
+      if (error && error.code !== 'PGRST116') throw error
+    } else {
+      console.log('Subscription using pre-provided initial game data', roomCode)
+    }
+    
+    if (!data) {
+      errorMessage.value = "Game room not found."
+      startGamePolling(roomCode)
+      return
+    }
+    
+    syncStateMap(data)
+
+    // --- YOUR REALTME CHANNELS & SUBSCRIPTION CODE GOES HERE ---
+    // Example:
+    // gameChannel = supabase.channel(...)
+    // .on(...)
+    // .subscribe()
+
+  // 2. YOU MUST INCLUDE THIS CATCH BLOCK TO COMPLY WITH THE OPENED TRY
+  } catch (err) {
+    console.error('Fatal error setting up subscription:', err)
+    errorMessage.value = "Error connecting to realtime server. Falling back to polling."
+    startGamePolling(roomCode)
+  }
+}
+
+function syncStateMap(data) {
+  if (!data) return
+  boardFlat.value = Array.isArray(data.board_state) ? data.board_state : Array(225).fill('')
+  bag.value = Array.isArray(data.tile_bag) ? data.tile_bag : []
+  players.value = Array.isArray(data.players_json) ? data.players_json : []
+  
+  joinMessage.value = data.join_notification || ''
+  latestPlayMessage.value = data.latest_play || ''
+  
+  if (players.value.length > 0 && data.current_turn_name) {
+    const idx = players.value.findIndex(p => p.name === data.current_turn_name)
+    currentPlayerIndex.value = idx !== -1 ? idx : 0
+  }
+
+  if (data.status === 'finished' && currentUser.value) {
+    supabase
+      .from('profiles')
+      .select('wins, losses')
+      .eq('id', currentUser.value.id)
+      .single()
+      .then(({ data: updatedProfile }) => {
+        if (updatedProfile) {
+          profileData.value = { ...profileData.value, ...updatedProfile }
+        }
+      })
+  }
+  gameDataLoaded = true
+}
+
+// --- CONFIRM AND COMMIT GAME TURN ENGINE ---
+async function confirmTurn() {
+  if (!isMyTurn.value) {
+    errorMessage.value = "It's not your turn!"
+    return
+  }
+  
+  if (pendingMoves.value.length === 0) {
+    errorMessage.value = "Place at least one tile!"
+    return
+  }
+  
+  if (!validatePlacement()) return
+  
+  isProcessing.value = true
+  errorMessage.value = '' 
+  
+  try {
+    const isValid = await validateWords(pendingMoves.value)
+    if (!isValid) return
+
+    const updatedBoardFlat = [...boardFlat.value]
+    const updatedPlayers = JSON.parse(JSON.stringify(players.value))
+    const updatedBag = [...bag.value]
+    const activePlayer = updatedPlayers[localPlayerIndex.value]
+
+    const turnScore = calculateScrabbleTurnScore(pendingMoves.value)
+    const sorted = [...pendingMoves.value].sort((a, b) => a.r !== b.r ? a.r - b.r : a.c - b.c)
+    const rackIndicesToRemove = sorted.map(m => m.rackId).filter(id => id !== undefined)
+    
+    sorted.forEach(move => {
+      updatedBoardFlat[move.r * 15 + move.c] = move.letter
+    })
+    
+    const keptTiles = activePlayer.rack.filter((_, idx) => !rackIndicesToRemove.includes(idx))
+    activePlayer.rack = keptTiles
+    activePlayer.score += turnScore
+
+    const needed = 7 - activePlayer.rack.length
+    if (needed > 0 && updatedBag.length > 0) {
+      const replacements = drawSmartTiles(updatedBag, needed)
+      activePlayer.rack.push(...replacements)
+    }
+
+    const wordDescription = getTurnWordDescription(pendingMoves.value)
+    const isBingo = pendingMoves.value.length === 7
+    const plainWordScore = isBingo ? (turnScore - 50) : turnScore
+    const newPlayLog = `${profileData.value.username || 'Player'} played "${wordDescription}" (+${plainWordScore} pts)${isBingo ? " (BINGO! +50 pts)" : ""}`
+    
+    addToHistory(profileData.value.username || 'Player', 'played', wordDescription, turnScore)
+    if (isBingo) addToHistory(profileData.value.username || 'Player', 'bingo', 'Played all 7 tiles!', 50)
+    
+    const nextPlayerIndex = (currentPlayerIndex.value + 1) % updatedPlayers.length
+    const nextPlayerName = updatedPlayers[nextPlayerIndex].name
+    
+    const shouldEndMatch = await isGameOver(updatedPlayers, updatedBag, updatedBoardFlat)
+    let winningPlayer = null
+    let losingPlayer = null
+
+    pendingMoves.value = []
+
+    if (shouldEndMatch) {
+      winningPlayer = updatedPlayers.reduce((max, p) => p.score > max.score ? p : max, updatedPlayers[0])
+      losingPlayer = updatedPlayers.find(p => p.id !== winningPlayer.id)
+      
+      addToHistory(winningPlayer.name, 'game_ended', `${winningPlayer.name} wins with ${winningPlayer.score} points!`, null)
+      
+      if (winningPlayer && winningPlayer.id && !winningPlayer.id.startsWith('guest-')) await supabase.rpc('increment_wins', { user_id: winningPlayer.id })
+      if (losingPlayer && losingPlayer.id && !losingPlayer.id.startsWith('guest-')) await supabase.rpc('increment_losses', { user_id: losingPlayer.id })
+    }
+
+    await supabase
+      .from('games')
+      .update({
+        board_state: updatedBoardFlat,
+        tile_bag: updatedBag,
+        players_json: updatedPlayers,
+        current_turn_name: shouldEndMatch ? 'game_over' : nextPlayerName,
+        latest_play: shouldEndMatch ? `Game Over! ${winningPlayer?.name} wins!` : newPlayLog,
+        status: shouldEndMatch ? 'finished' : 'active'
+      })
+      .eq('room_code', room.value)
+    
+    errorMessage.value = ''
+  } catch (err) {
+    console.error('Turn confirmation error:', err)
+    errorMessage.value = "Failed to submit turn. Please try again."
+  } finally { 
+    isProcessing.value = false
+  }
+}
+
+async function confirmForfeit() {
+  showForfeitModal.value = false
+  if (!room.value) return
+  isProcessing.value = true
+  
+  try {
+    const { data: gameRecord, error } = await supabase
+      .from('games')
+      .select('*')
+      .eq('room_code', room.value)
+      .maybeSingle()
+      
+    if (error) throw error
+    
+    if (gameRecord) {
+      const dbPlayers = gameRecord.players_json || []
+      const currentUserId = currentUser.value?.id || sessionGuestId.value
+      const opponent = dbPlayers.find(p => p.id !== currentUserId)
+      const currentUsername = profileData.value.username || 'Player'
+      
+      addToHistory(currentUsername, 'forfeited', `${currentUsername} forfeited the game`, null)
+      
+      if (opponent && opponent.id && !opponent.id.startsWith('guest-') && currentUser.value) {
+        await supabase.rpc('increment_wins', { user_id: opponent.id })
+        await supabase.rpc('increment_losses', { user_id: currentUser.value.id })
+      }
+    }
+    await supabase.from('games').delete().eq('room_code', room.value)
+  } catch (err) {
+    console.error(err)
+    errorMessage.value = "Failed to forfeit game safely."
+  } finally {
+    isProcessing.value = false
+    resetLocalState()
+  }
+}
+
+// --- INTERACTION FLOWS ---
 let lastClickTime = 0
 let lastClickedCell = { r: -1, c: -1 }
+
+function handleDrop({ r, c }) {
+  const sourceTile = activeDraggedTile.value || { letter: selectedLetter.value, rackId: selectedRackIdx.value }
+  const flatIndex = r * 15 + c
+  if (!sourceTile.letter || !isMyTurn.value || boardFlat.value[flatIndex] !== '') return
+  
+  if (boardDragSourceIdx.value !== null) {
+    pendingMoves.value.splice(boardDragSourceIdx.value, 1)
+    boardDragSourceIdx.value = null
+  }
+  const destOverlap = pendingMoves.value.findIndex(m => m.r === r && m.c === c)
+  if (destOverlap !== -1) {
+    pendingMoves.value.splice(destOverlap, 1)
+  }
+  pendingMoves.value.push({ r, c, letter: sourceTile.letter, rackId: sourceTile.rackId })
+  errorMessage.value = ''
+}
 
 function onCellClick({ r, c }) {
   const currentTime = Date.now()
   const pendingIdx = pendingMoves.value.findIndex(m => m.r === r && m.c === c)
-
   if (pendingIdx !== -1 && (currentTime - lastClickTime < 300) && lastClickedCell.r === r && lastClickedCell.c === c) {
     pendingMoves.value.splice(pendingIdx, 1)
+    lastClickTime = 0
     return
   }
-
   lastClickTime = currentTime
   lastClickedCell = { r, c }
-
-  if (!selectedLetter.value || !isMyTurn.value) return
-  handleDrop({ r, c })
-  selectedLetter.value = null
-  selectedRackIdx.value = null
-}
-
-function recallTiles() {
-  pendingMoves.value = []
-}
-
-function onDragStart(e, item) {
-  if (!isMyTurn.value) { e.preventDefault(); return }
-  boardDragSourceIdx.value = null
-  activeDraggedTile.value = { letter: item.letter, rackId: item.rackId }
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = 'move'
-    e.dataTransfer.setData('text/plain', 'rack_tile')
+  if (selectedLetter.value && isMyTurn.value) {
+    handleDrop({ r, c })
+    selectedLetter.value = null
+    selectedRackIdx.value = null
   }
-}
-
-function onDragEnd() {
-  activeDraggedTile.value = null
-  boardDragSourceIdx.value = null
 }
 
 function selectTile(letter, rackId) {
@@ -834,103 +1050,150 @@ function selectTile(letter, rackId) {
   selectedRackIdx.value = rackId
 }
 
-async function exchange() {
-  if (!isMyTurn.value || pendingMoves.value.length > 0) return
-  const roomRef = doc(db, 'rooms', room.value)
+function onDragStart(e, item) {
+  if (!isMyTurn.value) { e.preventDefault(); return }
+  boardDragSourceIdx.value = null
+  activeDraggedTile.value = { letter: item.letter, rackId: item.rackId }
+  e.dataTransfer.setData('text/plain', JSON.stringify(item))
+}
 
+function onBoardTileDragStart(e, moveItem) {
+  if (!isMyTurn.value) return
+  const foundMoveIdx = pendingMoves.value.findIndex(m => m.r === moveItem.r && m.c === moveItem.c)
+  let assignedRackId = moveItem.rackId
+  if (foundMoveIdx !== -1) {
+    assignedRackId = pendingMoves.value[foundMoveIdx].rackId
+    boardDragSourceIdx.value = foundMoveIdx
+  }
+  activeDraggedTile.value = { letter: moveItem.letter, rackId: assignedRackId }
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', 'board_tile')
+  }
+}
+
+function onDragEnd() {
+  activeDraggedTile.value = null
+  boardDragSourceIdx.value = null
+}
+
+async function exchange() {
+  if (!isMyTurn.value || pendingMoves.value.length > 0) {
+    errorMessage.value = "Cannot exchange tiles while tiles are placed on board!"
+    return
+  }
   const updatedPlayers = JSON.parse(JSON.stringify(players.value))
   const updatedBag = [...bag.value]
   const activePlayer = updatedPlayers[localPlayerIndex.value]
-
   const returningTiles = activePlayer.rack.splice(0, activePlayer.rack.length)
   updatedBag.unshift(...returningTiles)
-
   for (let i = updatedBag.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1))
     ;[updatedBag[i], updatedBag[j]] = [updatedBag[j], updatedBag[i]]
   }
-
   activePlayer.rack = drawSmartTiles(updatedBag, 7)
   const nextPlayerIndex = (currentPlayerIndex.value + 1) % updatedPlayers.length
-  
-  await updateDoc(roomRef, {
-    bag: updatedBag,
-    players: updatedPlayers,
-    currentPlayer: nextPlayerIndex,
-    latestPlay: `${name.value} exchanged their tiles.`,
-    lastActive: Date.now(),
-    expiresAt: Date.now() + (24 * 60 * 60 * 1000)
-  })
+  addToHistory(profileData.value.username || 'Player', 'exchanged', 'Exchanged all tiles', null)
+  await supabase
+    .from('games')
+    .update({ tile_bag: updatedBag, players_json: updatedPlayers, current_turn_name: updatedPlayers[nextPlayerIndex].name, latest_play: `${profileData.value.username || 'Player'} exchanged their tiles.` })
+    .eq('room_code', room.value)
 }
 
 async function pass() {
-  if (!isMyTurn.value || pendingMoves.value.length > 0) return
-  const roomRef = doc(db, 'rooms', room.value)
+  if (!isMyTurn.value || pendingMoves.value.length > 0) {
+    errorMessage.value = "Cannot pass with tiles on board!"
+    return
+  }
   const nextPlayerIndex = (currentPlayerIndex.value + 1) % players.value.length
+  addToHistory(profileData.value.username || 'Player', 'passed', 'Passed turn', null)
+  await supabase
+    .from('games')
+    .update({ current_turn_name: players.value[nextPlayerIndex].name, latest_play: `${profileData.value.username || 'Player'} passed their turn.` })
+    .eq('room_code', room.value)
+}
 
-  await updateDoc(roomRef, {
-    currentPlayer: nextPlayerIndex,
-    latestPlay: `${name.value} passed their turn.`,
-    lastActive: Date.now(),
-    expiresAt: Date.now() + (24 * 60 * 60 * 1000)
-  })
+function resetLocalState() {
+  room.value = ''
+  isJoined.value = false
+  pendingMoves.value = []
+  boardFlat.value = Array(225).fill('')
+  gameHistory.value = []
+  errorMessage.value = ''
+  gameDataLoaded = false
+  if (gameChannel) {
+    supabase.removeChannel(gameChannel)
+    gameChannel = null
+  }
 }
 
 function toggleMenu() {
   isMenuOpen.value = !isMenuOpen.value
 }
+
+function getActionIcon(action) {
+  const icons = { 'played': '🎯', 'passed': '⏭️', 'exchanged': '🔄', 'joined': '👋', 'game_started': '🎮', 'game_ended': '🏆', 'forfeited': '⚠️', 'bingo': '✨' }
+  return icons[action] || '📌'
+}
+
+watch(latestPlayMessage, (newMsg) => {
+  if (newMsg && newMsg.includes("BINGO!")) {
+    showBingoNotification.value = true
+    setTimeout(() => { showBingoNotification.value = false }, 2000)
+  }
+})
+
+const localPlayerIndex = computed(() => {
+  const currentUserId = currentUser.value?.id || sessionGuestId.value
+  return players.value.findIndex(p => p.id === currentUserId)
+})
+const isMyTurn = computed(() => {
+  if (!players.value.length || players.value.length < 2 || localPlayerIndex.value === -1) return false
+  return localPlayerIndex.value === currentPlayerIndex.value
+})
+const myRack = computed(() => {
+  const me = players.value[localPlayerIndex.value]
+  if (!me || !me.rack || !Array.isArray(me.rack)) return []
+  let workingRack = me.rack.map((t, index) => ({ letter: t.letter || t, pts: t.pts || 0, rackId: index }))
+  const usedIndices = new Set(pendingMoves.value.map(m => m.rackId).filter(id => id !== undefined))
+  workingRack = workingRack.filter((_, idx) => !usedIndices.has(idx))
+  return workingRack
+})
 </script>
 
 <template>
-  <!-- Invalid Word Notification -->
-  <Transition name="slide-down">
-    <div v-if="showInvalidWordNotification" class="invalid-word-notification">
-      <div class="invalid-word-content">
-        <span class="error-icon">❌</span>
-        <p>{{ invalidWordMessage }}</p>
-      </div>
-    </div>
-  </Transition>
-
-  <!-- Reconnection Loader -->
-  <div v-if="isReconnecting" class="reconnect-overlay">
+  <div v-if="isProcessing" class="loading-overlay">
     <div class="spinner-box">
       <div class="spinner"></div>
-      <p class="loading-text">{{ loadingMessage || 'Reconnecting to game...' }}</p>
-      <div class="reconnect-dots">
-        <span></span><span></span><span></span>
-      </div>
-      <div class="reconnect-progress">
-        Attempt {{ reconnectAttempts }} of {{ maxReconnectAttempts }}
-      </div>
-      <button v-if="reconnectAttempts >= 3" class="btn-retry-manual" @click="() => handleReconnection(room)">
-        Manual Retry
-      </button>
+      <p class="loading-text">{{ loadingMessage || 'Processing...' }}</p>
     </div>
   </div>
 
-  <!-- Processing Loader -->
-  <div v-if="isProcessing && !isReconnecting" class="loading-overlay">
+  <div v-if="isRoomLoading" class="loading-overlay">
     <div class="spinner-box">
       <div class="spinner"></div>
-      <p class="loading-text">{{ loadingMessage }}</p>
+      <p class="loading-text">{{ loadingMessage || 'Connecting to match arena...' }}</p>
     </div>
   </div>
 
-  <!-- Forfeit Modal -->
+  <div v-if="isSigningOut" class="loading-overlay">
+    <div class="spinner-box">
+      <div class="spinner"></div>
+      <p class="loading-text">Signing out...</p>
+    </div>
+  </div>
+  
   <div v-if="showForfeitModal" class="confirm-modal-backdrop">
     <div class="confirm-modal-box">
-      <div class="warn-icon">⚠️</div>
-      <h3>Forfeit Match?</h3>
-      <p>Are you sure you want to forfeit? Doing so ends the session immediately and awards your opponent the match win.</p>
+      <h3>Forfeit Game?</h3>
+      <p>This will award your opponent a permanent Win and register a Loss on your profile records.</p>
       <div class="modal-button-row">
-        <button class="modal-btn btn-cancel" @click="cancelForfeit">No, Continue Game</button>
-        <button class="modal-btn btn-confirm-forfeit" @click="confirmForfeit">Yes, Forfeit Match</button>
+        <button class="modal-btn btn-cancel" @click="showForfeitModal = false">Cancel</button>
+        <button class="modal-btn btn-confirm-forfeit" @click="confirmForfeit">Confirm Forfeit</button>
       </div>
     </div>
   </div>
 
-  <!-- Bingo Notification -->
   <Transition name="fade">
     <div v-if="showBingoNotification" class="bingo-popup-overlay">
       <div class="bingo-popup-content">
@@ -941,374 +1204,1326 @@ function toggleMenu() {
     </div>
   </Transition>
 
-  <!-- Sidebar -->
-  <div :class="['sandwich-sidebar', { 'drawer-open': isMenuOpen }]">
-    <div class="drawer-header">
-      <h3>Match Dashboard</h3>
-      <button class="close-btn" @click="toggleMenu">✕</button>
-    </div>
-    
-    <div class="drawer-body">
-      <div class="bag-counter-card">
-        <div class="bag-stat">
-          <span class="bag-qty">{{ bag.length }}</span>
-          <span class="bag-lbl">Remaining Tiles in Bag</span>
-        </div>
-      </div>
-
-      <div class="history-section">
-        <h4>Game History</h4>
-        <div class="history-timeline">
-          <div v-for="(log, lIdx) in gameHistory.slice().reverse()" :key="lIdx" class="timeline-log-row">
-            📌 {{ log }}
-          </div>
-          <div v-if="!gameHistory.length" class="empty-history">No events logged yet.</div>
-        </div>
+  <!-- LOBBY WRAPPER VIEW -->
+  <div v-if="!isJoined" class="lobby-wrapper">
+    <!-- TOP INTEGRATED BRAND HEADER -->
+    <header class="lobby-brand-bar">
+      <div class="brand-left">
+        <span class="scrabble-logo-icon">🆂</span>
+        <h1 class="main-logo-text">Scrabble<span class="dot-accent">.</span></h1>
       </div>
       
-      <div class="sidebar-footer-actions">
-        <button class="btn btn-sidebar-forfeit" @click="triggerForfeitConfirmation">🏳️ Forfeit Match</button>
-      </div>
-    </div>
-  </div>
-  <div v-if="isMenuOpen" class="drawer-backdrop" @click="toggleMenu"></div>
-
-  <!-- Lobby -->
-  <div v-if="!isJoined" class="lobby-container">
-    <div class="lobby-card">
-      <h1 class="brand-title">Scrabble.</h1>
-      <p class="subtitle">Enter details to create or join a match room</p>
-      <div v-if="errorMessage" class="error-banner">{{ errorMessage }}</div>
-      <div class="input-group">
-        <label>Your Name</label>
-        <input v-model="playerName" type="text" placeholder="e.g., Davies" maxlength="12" />
-      </div>
-      <hr class="divider"/>
-      <div class="lobby-actions">
-        <button class="btn btn-primary btn-block" @click="handleCreateRoom">Create New Room</button>
-        <div class="join-zone">
-          <input v-model="inputRoomCode" type="text" placeholder="Enter 6-Char Code" maxlength="6" class="code-input" />
-          <button class="btn btn-alt" @click="() => handleJoinRoom(false)">Join Room</button>
+      <!-- AUTHENTICATED USER DROPDOWN PROFILE ZONE -->
+      <div class="user-profile-widget" v-if="currentUser || isGuestMode">
+        <div class="user-info" @click="toggleProfileMenu">
+          <div class="avatar-circle">
+            {{ (profileData?.username || 'G').charAt(0).toUpperCase() }}
+          </div>
+          <span class="user-display-name">Profile</span>
+          <span class="dropdown-chevron">▼</span>
         </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Game -->
-  <div v-else class="game container">
-    <header class="game-header">
-      <div class="header-left-group">
-        <button class="sandwich-trigger" @click="toggleMenu" aria-label="Open Game Menu">
-          <div class="bar"></div>
-          <div class="bar"></div>
-          <div class="bar"></div>
-        </button>
-        <h2>Room Code: <span class="room-highlight">{{ room }}</span></h2>
-      </div>
-
-      <div class="header-right-group">
-        <div :class="['turn-indicator', { 'your-turn': isMyTurn }]">
-          {{ isMyTurn ? "Your Turn!" : "Waiting for opponent..." }}
-        </div>
+        
+        <Transition name="dropdown-slide">
+          <div v-if="showProfileMenu" class="profile-dropdown">
+            <div class="dropdown-header-info">
+              <p class="info-username">{{ profileData?.username || 'Guest' }}</p>
+              <p class="info-email">{{ currentUser ? currentUser.email : 'Playing as guest' }}</p>
+            </div>
+            <div class="stats-grid-row">
+              <div class="stat-box wins">
+                <span class="stat-count">{{ profileData?.wins || 0 }}</span>
+                <span class="stat-label">Wins</span>
+              </div>
+              <div class="stat-box losses">
+                <span class="stat-count">{{ profileData?.losses || 0 }}</span>
+                <span class="stat-label">Losses</span>
+              </div>
+            </div>
+            <div class="dropdown-action-divider"></div>
+            <button class="dropdown-logout-btn" @click="handleLogout" :disabled="isSigningOut">
+              <span class="logout-icon">{{ isSigningOut ? '⏳' : '🚪' }}</span>
+              {{ isSigningOut ? 'Signing out...' : (currentUser ? 'Sign Out Account' : 'Leave Guest Session') }}
+            </button>
+          </div>
+        </Transition>
       </div>
     </header>
 
-    <section class="notification-center">
-      <div v-if="joinMessage" class="join-alert">ℹ️ {{ joinMessage }}</div>
-      <div v-if="latestPlayMessage" class="play-alert">🎯 Last Move: <span class="bold-log">{{ latestPlayMessage }}</span></div>
-    </section>
-
-    <main class="game-arena">
-      <div class="board-wrapper">
-        <Board :board="board2D" @drop="handleDrop" @cell-click="onCellClick" />
+    <!-- CONTENT DISPLAY SCREEN CONTAINER -->
+    <main class="lobby-content-container">
+      <!-- AUTHENTICATION FORM SCREEN -->
+      <section v-if="!currentUser && !isLoadingProfile && !isGuestMode" class="auth-panel-card">
+        <div class="card-header">
+          <h2>{{ isSignUpMode ? 'Create Account' : 'Welcome Back' }}</h2>
+          <p class="card-subtitle">
+            {{ isSignUpMode ? 'Register an identity to track scores and match history' : 'Sign in to access your game profiles' }}
+          </p>
+        </div>
         
-        <div class="tile-point-indicators">
-          <div v-for="(row, rIndex) in board2D" :key="rIndex" class="indicator-row">
-            <div v-for="(cell, cIndex) in row" :key="cIndex" class="indicator-cell">
-              <div 
-                v-if="cell" 
-                class="draggable-board-surface-node"
-                :draggable="isMyTurn"
-                @dragstart="onBoardTileDragStart($event, { r: rIndex, c: cIndex, letter: cell })"
-                @dragend="onDragEnd"
-              >
-                <span class="board-pts-badge">{{ LETTER_SCORES[cell] || 1 }}</span>
+        <div v-if="errorMessage" class="error-banner-alert">
+          <span class="alert-icon">⚠️</span> {{ errorMessage }}
+        </div>
+
+        <div class="form-body">
+          <div v-if="isSignUpMode" class="input-field-group">
+            <label class="field-label">Unique Handle</label>
+            <input v-model="authUsername" type="text" placeholder="e.g., Davies" class="styled-text-input" />
+          </div>
+          
+          <div class="input-field-group">
+            <label class="field-label">Email Address</label>
+            <input v-model="authEmail" type="email" placeholder="you@example.com" class="styled-text-input" />
+          </div>
+          
+          <div class="input-field-group">
+            <label class="field-label">Account Password</label>
+            <input v-model="authPassword" type="password" placeholder="••••••••" class="styled-text-input" />
+          </div>
+
+          <button class="base-action-btn primary-solid" @click="handleAuthAction" :disabled="isProcessing">
+            {{ isSignUpMode ? 'Register Account' : 'Sign In' }}
+          </button>
+          
+          <p class="auth-toggle-switch" @click="isSignUpMode = !isSignUpMode">
+            {{ isSignUpMode ? "Already have an account? Log In" : "Don't have an account? Sign Up Here" }}
+          </p>
+
+          <div class="guest-divider">
+            <span class="guest-divider-line"></span>
+            <span class="guest-divider-text">or</span>
+            <span class="guest-divider-line"></span>
+          </div>
+
+          <button class="base-action-btn guest-btn" @click="signInAsGuest" :disabled="isProcessing">
+            👤 Continue as Guest
+          </button>
+        </div>
+      </section>
+
+      <!-- SPINNER LOADING CARD -->
+      <section v-else-if="isLoadingProfile" class="auth-panel-card central-spinner-layout">
+        <div class="spinner-element"></div>
+        <p class="loading-label-text">Fetching workspace profile...</p>
+      </section>
+
+      <!-- MATCH ROOM CONNECTION LOBBY -->
+      <section v-else class="auth-panel-card room-lobby-card">
+        <div class="card-header">
+          <h2>
+            {{ profileData && profileData.username ? `Welcome back, ${profileData.username}` : 'Game Workspace' }}
+          </h2>
+          <p class="card-subtitle">Initialize a fresh arena or connect into a pending multiplayer game</p>
+        </div>
+
+        <div v-if="errorMessage" class="error-banner-alert">
+          <span class="alert-icon">⚠️</span> {{ errorMessage }}
+        </div>
+
+        <div class="form-body">
+          <div class="input-field-group">
+            <label class="field-label">Display Player Name</label>
+            <input v-model="playerName" type="text" placeholder="Enter matching nickname..." maxlength="12" class="styled-text-input text-center font-bold font-lg" />
+          </div>
+
+          <div class="workspace-action-split">
+            <div class="action-block-left">
+              <button class="base-action-btn primary-solid-green large-weight" @click="handleCreateRoom">
+                ✨ Create New Arena
+              </button>
+            </div>
+
+            <div class="split-vertical-divider">
+              <span class="divider-text">OR</span>
+            </div>
+
+            <div class="action-block-right">
+              <div class="join-code-input-wrapper">
+                <input v-model="inputRoomCode" type="text" placeholder="6-CHAR CODE" maxlength="6" class="styled-text-input code-box-format uppercase" />
+                <button class="base-action-btn primary-outline large-weight" @click="handleJoinRoom">
+                  Join Room
+                </button>
               </div>
             </div>
           </div>
         </div>
-      </div>
+      </section>
+    </main>
+  </div>
 
-      <div class="rack-wrapper">
-        <h3 class="rack-label">Your Rack:</h3>
-        <div class="rack" :class="{ 'disabled-rack': !isMyTurn }" role="list">
-          <component :is="Tile" 
-            v-for="t in myRack" 
-            :key="t.rackId" 
-            :letter="t.letter" 
-            :score="t.pts" 
-            :selected="selectedRackIdx === t.rackId" 
-            @dragstart="onDragStart($event, t)" 
-            @dragend="onDragEnd"
-            @click="selectTile(t.letter, t.rackId)"
-          />
-          <div v-if="!myRack.length && !pendingMoves.length" class="rack-empty">Waiting for opponent to connect...</div>
-        </div>
+  <!-- MAIN GAME ARENA INTERFACE -->
+  <div v-else class="game-view-layout">
+    <!-- SANDWICH SLIDE DRAWER SIDEBAR -->
+    <aside :class="['sandwich-sidebar', { 'drawer-open': isMenuOpen }]">
+      <div class="drawer-header">
+        <h3>Match Dashboard</h3>
+        <button class="close-btn" @click="toggleMenu">✕</button>
       </div>
-
-      <div v-if="isMyTurn && pendingMoves.length > 0" class="turn-confirmation-bar">
-         <button class="btn btn-danger" @click="recallTiles">Clear All Staged</button>
-         <button class="btn btn-success" @click="confirmTurn">Confirm & Submit Word</button>
-      </div>
-
-      <div class="controls">
-        <div class="scores">
-          <h3>Scoreboard</h3>
-          <div v-for="(p, idx) in players" :key="idx" :class="['player-row', { 'active-player': idx === currentPlayerIndex }]">
-            <span class="dot">●</span> 
-            <span class="p-name">{{ p.name }} <span v-if="p.name.toLowerCase() === name.toLowerCase()">(You)</span></span>
-            <span class="p-score">{{ p.score }} pts</span>
+      
+      <div class="drawer-body">
+        <!-- BAG STATE COUNTER CARD -->
+        <div class="bag-counter-card">
+          <div class="bag-stat">
+            <span class="bag-qty">{{ bag.length }}</span>
+            <span class="bag-lbl">Remaining Tiles</span>
           </div>
         </div>
-        <div class="actions">
-          <button :disabled="!isMyTurn || pendingMoves.length > 0" class="btn btn-alt" @click="exchange">Exchange All</button>
-          <button :disabled="!isMyTurn || pendingMoves.length > 0" class="btn btn-primary" @click="pass">Pass Turn</button>
+
+        <!-- LIVE STREAM HISTORY TIMELINE -->
+        <div class="history-section">
+          <h4>Game History</h4>
+          <div class="history-timeline">
+            <div v-for="log in gameHistory" :key="log.id" class="timeline-log-row">
+              <span class="log-icon">{{ getActionIcon(log.action) }}</span>
+              <div class="log-details-box">
+                <p class="log-text-line">
+                  <strong class="log-player">{{ log.playerName }}</strong> 
+                  <span class="log-desc">{{ log.details }}</span>
+                </p>
+                <span class="log-timestamp">
+                  {{ new Date(log.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'}) }}
+                </span>
+              </div>
+              <span v-if="log.scoreChange !== null" :class="['log-score-badge', log.scoreChange >= 50 ? 'high-score' : '']">
+                +{{ log.scoreChange }}
+              </span>
+            </div>
+            <div v-if="!gameHistory.length" class="empty-history">
+              No moves registered in this match session yet.
+            </div>
+          </div>
+        </div>
+
+        <!-- SIDEBAR ACTIONS FOOTER -->
+        <div class="sidebar-footer-actions">
+          <button class="btn-sidebar-forfeit" @click="showForfeitModal = true">
+            🏳️ Forfeit Match
+          </button>
         </div>
       </div>
-    </main>
+    </aside>
+
+    <!-- SIDEBAR DRAWER OVERLAY BACKDROP -->
+    <div v-if="isMenuOpen" class="drawer-backdrop" @click="toggleMenu"></div>
+
+    <!-- ARENA CONTENT STRUCTURE -->
+    <div class="arena-main-content">
+      <!-- TOP MATCH STATUS INFORMATION ACTION BAR -->
+      <header class="arena-status-bar">
+        <div class="bar-left-cluster">
+          <button class="sandwich-trigger" @click="toggleMenu">
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+          </button>
+          <div class="room-identity">
+            <span class="label">ROOM</span>
+            <span class="code-badge">{{ room }}</span>
+          </div>
+        </div>
+
+        <!-- SCOREBOARD STATUS CLUSTER DISPLAY -->
+        <div class="arena-scoreboard">
+          <div v-for="(p, index) in players" :key="p.id || index" :class="['score-pill', { 'active-turn-indicator': index === currentPlayerIndex, 'is-me-pill': p.id === (currentUser?.id || sessionGuestId) }]">
+            <span class="turn-dot"></span>
+            <span class="player-name">{{ p.name }}</span>
+            <span class="player-score">{{ p.score }} pts</span>
+          </div>
+        </div>
+
+        <div class="bar-right-actions">
+          <div class="live-status-ticker">
+            <span class="pulse-indicator"></span>
+            <p class="ticker-message">{{ latestPlayMessage || joinMessage || 'Waiting for gameplay turns...' }}</p>
+          </div>
+        </div>
+      </header>
+
+      <!-- SYSTEM GAME BOARD AND RACK CONTROLS WRAPPER -->
+      <main class="arena-layout-plane">
+        <!-- SYSTEM INTERACTIVE GAME GRID MATRICES -->
+        <div class="board-wrapper-frame">
+          <Board :board="board2D" :pending-moves="pendingMoves" @cell-click="onCellClick" @drop-tile="handleDrop" @dragstart-placed="onBoardTileDragStart" />
+        </div>
+
+        <!-- LOWER PLAYERS HAND RACK CONTROLLER ZONE -->
+        <footer class="player-interaction-dock">
+          <div class="interaction-dock-inner">
+            <!-- CURRENT PLAYER HAND TILES RACK DECK -->
+            <div class="rack-outer-frame">
+              <div class="rack-wood-shelf">
+                <div class="rack-tiles-container">
+                  <Tile v-for="tile in myRack" :key="tile.rackId" :letter="tile.letter" :pts="tile.pts" :is-selected="selectedRackIdx === tile.rackId" @click="selectTile(tile.letter, tile.rackId)" @dragstart="onDragStart($event, tile)" @dragend="onDragEnd" />
+                </div>
+              </div>
+              <div class="rack-base-shadow"></div>
+            </div>
+
+            <!-- CORE GAME EXECUTION TURN BUTTON ROW -->
+            <div class="action-button-matrix-row">
+              <button class="control-btn play-turn-btn" @click="confirmTurn" :disabled="!isMyTurn || pendingMoves.length === 0">
+                🚀 Play Turn
+              </button>
+              <button class="control-btn utility-btn" @click="recallTiles" :disabled="pendingMoves.length === 0">
+                ↩️ Recall
+              </button>
+              <button class="control-btn utility-btn" @click="exchange" :disabled="!isMyTurn || pendingMoves.length > 0">
+                🔄 Exchange
+              </button>
+              <button class="control-btn utility-btn" @click="pass" :disabled="!isMyTurn || pendingMoves.length > 0">
+                ⏭️ Pass
+              </button>
+            </div>
+
+            <!-- DYNAMIC INTERACTION CONSOLE ERROR ALERTS -->
+            <div class="error-console-wrapper">
+              <Transition name="fade">
+                <p v-if="errorMessage" class="console-error-message">
+                  <span class="icon">❌</span> {{ errorMessage }}
+                </p>
+              </Transition>
+            </div>
+          </div>
+        </footer>
+      </main>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.game-arena, .board-wrapper, .rack, .indicator-cell, .draggable-board-surface-node {
-  touch-action: none !important;
-  -webkit-text-size-adjust: 100%;
-  -webkit-user-select: none;
-  user-select: none;
+/* --- BASE SYSTEM & INTERFACE STRUCTURAL FRAMEWORKS --- */
+.lobby-wrapper {
+  min-height: 100vh;
+  background-color: #f4f6f8;
+  display: flex;
+  flex-direction: column;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
-/* Invalid Word Notification */
-.invalid-word-notification {
-  position: fixed;
-  top: 20px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 100000;
-  animation: slideDown 0.3s ease-out;
+/* TOP LOBBY HEADER BAR BRANDING ELEMENTS */
+.lobby-brand-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 32px;
+  background-color: #ffffff;
+  border-bottom: 1px solid #e1e4e8;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
 }
 
-.invalid-word-content {
-  background: #ff5252;
-  color: white;
-  padding: 12px 24px;
-  border-radius: 8px;
+.brand-left {
   display: flex;
   align-items: center;
   gap: 12px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-  font-weight: bold;
 }
 
-.error-icon {
-  font-size: 20px;
+.scrabble-logo-icon {
+  background-color: #e67e22;
+  color: #ffffff;
+  font-size: 24px;
+  font-weight: 800;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  border-radius: 6px;
+  box-shadow: 0 2px 4px rgba(230, 126, 34, 0.3);
 }
 
-@keyframes slideDown {
-  from {
-    opacity: 0;
-    transform: translateX(-50%) translateY(-100%);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0);
-  }
+.main-logo-text {
+  font-size: 24px;
+  font-weight: 800;
+  color: #2c3e50;
+  letter-spacing: -0.5px;
+  margin: 0;
 }
 
-.slide-down-enter-active, .slide-down-leave-active {
-  transition: all 0.3s ease;
-}
-.slide-down-enter-from, .slide-down-leave-to {
-  opacity: 0;
-  transform: translateX(-50%) translateY(-100%);
+.dot-accent {
+  color: #e67e22;
 }
 
-/* Reconnect Overlay */
-.reconnect-overlay {
+/* AUTHENTICATED WORKSPACE USER ACCREDITATION COMPONENT */
+.user-profile-widget {
+  position: relative;
+  z-index: 1001;
+}
+
+.user-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  background-color: #f8f9fa;
+  border: 1px solid #e1e4e8;
+  border-radius: 30px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.user-info:hover {
+  background-color: #f1f3f5;
+  border-color: #d1d5db;
+}
+
+.avatar-circle {
+  width: 26px;
+  height: 26px;
+  background-color: #34495e;
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 13px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  border-radius: 50%;
+}
+
+.user-display-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: #34495e;
+}
+
+.dropdown-chevron {
+  font-size: 10px;
+  color: #7f8c8d;
+}
+
+/* INTERACTIVE ACCOUNT DROPDOWN OVERLAYS */
+.profile-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 240px;
+  background-color: #ffffff;
+  border: 1px solid #e1e4e8;
+  border-radius: 12px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.08);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.dropdown-header-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.info-email {
+  font-size: 12px;
+  color: #7f8c8d;
+  margin: 0;
+  word-break: break-all;
+}
+
+.stats-grid-row {
+  display: flex;
+  gap: 10px;
+}
+
+.stat-box {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.stat-box.wins {
+  background-color: #e8f8f5;
+  border: 1px solid #a3e4d7;
+}
+
+.stat-box.losses {
+  background-color: #fdf2e9;
+  border: 1px solid #fadbd8;
+}
+
+.stat-count {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.stat-box.wins .stat-count { color: #16a085; }
+.stat-box.losses .stat-count { color: #e74c3c; }
+
+.stat-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #7f8c8d;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+.dropdown-action-divider {
+  height: 1px;
+  background-color: #e1e4e8;
+}
+
+.dropdown-logout-btn {
+  background: none;
+  border: 1px solid #fadbd8;
+  padding: 8px 12px;
+  border-radius: 6px;
+  color: #c0392b;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.15s ease;
+}
+
+.dropdown-logout-btn:hover {
+  background-color: #fdf2e9;
+  border-color: #e74c3c;
+}
+
+/* LOBBY INTERFACE CONTENT CARD WRAPPERS */
+.lobby-content-container {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 40px 20px;
+}
+
+.auth-panel-card {
+  width: 100%;
+  max-width: 520px;
+  background-color: #ffffff;
+  border: 1px solid #e1e4e8;
+  border-radius: 16px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+  padding: 40px;
+  box-sizing: border-box;
+}
+
+.card-header {
+  margin-bottom: 28px;
+  text-align: center;
+}
+
+.card-header h2 {
+  font-size: 26px;
+  font-weight: 800;
+  color: #2c3e50;
+  margin: 0 0 8px 0;
+}
+
+.card-subtitle {
+  font-size: 14px;
+  color: #7f8c8d;
+  margin: 0;
+  line-height: 1.4;
+}
+
+/* INPUT COMPONENT FORM ELEMENTS */
+.form-body {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.input-field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.field-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #34495e;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.styled-text-input {
+  width: 100%;
+  padding: 12px 16px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-size: 15px;
+  color: #2c3e50;
+  background-color: #ffffff;
+  box-sizing: border-box;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.styled-text-input:focus {
+  outline: none;
+  border-color: #3498db;
+  box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.15);
+}
+
+.text-center { text-align: center; }
+.font-bold { font-weight: 700; }
+.font-lg { font-size: 18px; }
+.uppercase { transform: uppercase; }
+
+/* ERROR ALERT MESSAGE BANNERS */
+.error-banner-alert {
+  background-color: #fdf2e9;
+  border-left: 4px solid #e67e22;
+  padding: 12px 16px;
+  border-radius: 0 8px 8px 0;
+  color: #d35400;
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+/* BUTTON ACTION FORM ELEMENTS */
+.base-action-btn {
+  width: 100%;
+  padding: 14px 24px;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  box-sizing: border-box;
+}
+
+.base-action-btn.primary-solid {
+  background-color: #3498db;
+  color: #ffffff;
+}
+.base-action-btn.primary-solid:hover { background-color: #2980b9; }
+
+.base-action-btn.primary-solid-green {
+  background-color: #2ecc71;
+  color: #ffffff;
+  box-shadow: 0 4px 6px rgba(46, 204, 113, 0.2);
+}
+.base-action-btn.primary-solid-green:hover { background-color: #27ae60; }
+
+.base-action-btn.primary-outline {
+  background: none;
+  border: 2px solid #3498db;
+  color: #3498db;
+}
+.base-action-btn.primary-outline:hover {
+  background-color: #ebf5fb;
+}
+
+.auth-toggle-switch {
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: #3498db;
+  cursor: pointer;
+  margin: 8px 0 0 0;
+  user-select: none;
+}
+.auth-toggle-switch:hover { text-decoration: underline; }
+
+.guest-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0;
+}
+
+.guest-divider-line {
+  flex: 1;
+  height: 1px;
+  background-color: #e1e4e8;
+}
+
+.guest-divider-text {
+  font-size: 12px;
+  color: #7f8c8d;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.base-action-btn.guest-btn {
+  display: none !important; /* Visual safety gate: hidden completely from layout view but keeps logic active */
+}
+
+.info-username {
+  font-size: 14px;
+  font-weight: 700;
+  color: #2c3e50;
+  margin: 0;
+}
+
+.dropdown-logout-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* SPINNER ELEMENTS FOR CARD ACTIONS */
+.central-spinner-layout {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: 60px 40px !important;
+  text-align: center;
+}
+
+.spinner-element {
+  width: 48px;
+  height: 48px;
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid #3498db;
+  border-radius: 50%;
+  animation: spin-kf 1s linear infinite;
+  margin-bottom: 20px;
+}
+
+.loading-label-text {
+  font-size: 15px;
+  font-weight: 600;
+  color: #7f8c8d;
+  margin: 0;
+}
+
+@keyframes spin-kf {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* LOBBY SPLIT CARD MODULE ACTIONS */
+.workspace-action-split {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  margin-top: 12px;
+}
+
+.action-block-left, .action-block-right {
+  flex: 1;
+}
+
+.split-vertical-divider {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  align-self: stroke;
+}
+
+.split-vertical-divider::before {
+  content: '';
+  width: 1px;
+  height: 100px;
+  background-color: #e1e4e8;
+}
+
+.divider-text {
+  position: absolute;
+  background-color: #ffffff;
+  padding: 6px 0;
+  color: #95a5a6;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.join-code-input-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.code-box-format {
+  text-align: center;
+  font-weight: 800;
+  letter-spacing: 2px;
+  font-size: 16px;
+  text-transform: uppercase;
+}
+
+/* --- MAIN MULTIPLAYER MATCH ARENA INTERFACES --- */
+.game-view-layout {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background-color: #2c3e50;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.arena-main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* ARENA SYSTEM STAT TICKER BAR MODULES */
+.arena-status-bar {
+  height: 64px;
+  background-color: #1a252f;
+  border-bottom: 1px solid #34495e;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 24px;
+  box-sizing: border-box;
+}
+
+.bar-left-cluster {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+/* DRAWER MENU SANDWICH TOGGLE TRIGGER BUTTON */
+.sandwich-trigger {
+  background: none;
+  border: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 4px;
+}
+.sandwich-trigger:hover { background-color: #2c3e50; }
+.sandwich-trigger .bar {
+  width: 20px;
+  height: 2px;
+  background-color: #ffffff;
+  border-radius: 2px;
+}
+
+.room-identity {
+  display: flex;
+  flex-direction: column;
+}
+.room-identity .label {
+  font-size: 9px;
+  font-weight: 700;
+  color: #95a5a6;
+  letter-spacing: 0.5px;
+}
+.room-identity .code-badge {
+  font-size: 15px;
+  font-weight: 800;
+  color: #ecc94b;
+  letter-spacing: 0.5px;
+}
+
+/* MATCH ARENA REALTIME SCOREBOARD */
+.arena-scoreboard {
+  display: flex;
+  gap: 12px;
+}
+
+.score-pill {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  background-color: #2c3e50;
+  border: 1px solid #34495e;
+  border-radius: 20px;
+  color: #bdc3c7;
+  transition: all 0.25s ease;
+}
+
+.score-pill .turn-dot {
+  width: 6px;
+  height: 6px;
+  background-color: transparent;
+  border-radius: 50%;
+}
+
+.score-pill .player-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.score-pill .player-score {
+  font-size: 13px;
+  font-weight: 800;
+  color: #ffffff;
+}
+
+.score-pill.is-me-pill {
+  border-color: #4a5568;
+}
+.score-pill.is-me-pill .player-name {
+  color: #ffffff;
+}
+
+.score-pill.active-turn-indicator {
+  background-color: #2c5282;
+  border-color: #3182ce;
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(49, 130, 206, 0.3);
+}
+.score-pill.active-turn-indicator .turn-dot {
+  background-color: #63b3ed;
+  box-shadow: 0 0 8px #63b3ed;
+  animation: pulse-kf 1.5s infinite;
+}
+
+@keyframes pulse-kf {
+  0% { transform: scale(1); opacity: 0.5; }
+  50% { transform: scale(1.3); opacity: 1; }
+  100% { transform: scale(1); opacity: 0.5; }
+}
+
+.bar-right-actions {
+  display: flex;
+  align-items: center;
+}
+
+.live-status-ticker {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background-color: #111827;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid #1f2937;
+  max-width: 320px;
+}
+
+.pulse-indicator {
+  width: 8px;
+  height: 8px;
+  background-color: #e67e22;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.ticker-message {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e2e8f0;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ARENA PLANE WORKSPACE GRID ARRANGEMENTS */
+.arena-layout-plane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px;
+  box-sizing: border-box;
+  overflow-y: auto;
+}
+
+.board-wrapper-frame {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  min-height: 0;
+}
+
+/* INTERACTION CONSOLE CONTROL LABELS */
+.player-interaction-dock {
+  width: 100%;
+  max-width: 680px;
+  margin-top: 16px;
+  flex-shrink: 0;
+}
+
+.interaction-dock-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+/* WOOD SHELF TILES CONTROLLER TRACKS */
+.rack-outer-frame {
+  position: relative;
+  width: 100%;
+  max-width: 480px;
+}
+
+.rack-wood-shelf {
+  background: linear-gradient(to bottom, #d69e2e, #b7791f);
+  border-top: 1px solid #f6e05e;
+  border-bottom: 2px solid #744210;
+  border-radius: 4px;
+  padding: 8px 16px;
+  box-shadow: 0 6px 10px rgba(0,0,0,0.3), inset 0 1px 2px rgba(255,255,255,0.2);
+  display: flex;
+  justify-content: center;
+}
+
+.rack-tiles-container {
+  display: flex;
+  gap: 6px;
+  min-height: 48px;
+  justify-content: center;
+  align-items: center;
+}
+
+.rack-base-shadow {
+  position: absolute;
+  top: 100%;
+  left: 4%;
+  width: 92%;
+  height: 8px;
+  background: rgba(0,0,0,0.4);
+  filter: blur(4px);
+  border-radius: 50%;
+  z-index: 1;
+}
+
+/* ACTION BUTTON MATRIX DESIGN */
+.action-button-matrix-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.control-btn {
+  padding: 12px 16px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.control-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.play-turn-btn {
+  flex: 2;
+  background-color: #3182ce;
+  color: #ffffff;
+  box-shadow: 0 4px 6px rgba(49,130,206,0.2);
+}
+.play-turn-btn:not(:disabled):hover { background-color: #2b6cb0; }
+
+.utility-btn {
+  flex: 1;
+  background-color: #4a5568;
+  color: #e2e8f0;
+  border: 1px solid #718096;
+}
+.utility-btn:not(:disabled):hover {
+  background-color: #718096;
+  color: #ffffff;
+}
+
+/* ALERTS SYSTEM ERROR LABELS */
+.error-console-wrapper {
+  height: 20px;
+}
+
+.console-error-message {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fc8181;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* --- SIDEBAR PANEL DRAWER SYSTEM CSS STYLE --- */
+.sandwich-sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 320px;
+  height: 100vh;
+  background-color: #1a252f;
+  border-right: 1px solid #2c3e50;
+  box-shadow: 5px 0 25px rgba(0,0,0,0.3);
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(-100%);
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.sandwich-sidebar.drawer-open {
+  transform: translateX(0);
+}
+
+.drawer-header {
+  padding: 20px;
+  border-bottom: 1px solid #2c3e50;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #111827;
+}
+
+.drawer-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  color: #a0aec0;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px;
+}
+.close-btn:hover { color: #ffffff; }
+
+.drawer-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  overflow-y: auto;
+  gap: 24px;
+}
+
+.bag-counter-card {
+  background-color: #2c3e50;
+  border-radius: 8px;
+  padding: 16px;
+  border: 1px solid #34495e;
+}
+
+.bag-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.bag-qty {
+  font-size: 28px;
+  font-weight: 800;
+  color: #ecc94b;
+}
+
+.bag-lbl {
+  font-size: 12px;
+  font-weight: 600;
+  color: #a0aec0;
+  text-transform: uppercase;
+  margin-top: 4px;
+}
+
+/* LOGS TIMELINE TIMESTAMPS STYLE */
+.history-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.history-section h4 {
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: #e2e8f0;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.history-timeline {
+  flex: 1;
+  background-color: #111827;
+  border: 1px solid #2c3e50;
+  border-radius: 8px;
+  padding: 10px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.timeline-log-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px;
+  background-color: #1f2937;
+  border-radius: 6px;
+  border: 1px solid #2c3e50;
+}
+
+.log-icon { font-size: 14px; }
+.log-details-box { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.log-text-line { margin: 0; font-size: 12px; color: #e2e8f0; line-height: 1.3; }
+.log-player { color: #63b3ed; }
+.log-timestamp { font-size: 10px; color: #718096; }
+
+.log-score-badge {
+  font-size: 11px;
+  font-weight: 700;
+  background-color: #2d3748;
+  color: #a0aec0;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.log-score-badge.high-score {
+  background-color: #234e52;
+  color: #4fd1c5;
+}
+
+.empty-history {
+  padding: 20px;
+  text-align: center;
+  color: #718096;
+  font-size: 12px;
+  font-style: italic;
+}
+
+.sidebar-footer-actions {
+  margin-top: auto;
+}
+
+.btn-sidebar-forfeit {
+  width: 100%;
+  background: none;
+  border: 1px solid #742a2a;
+  padding: 12px;
+  border-radius: 6px;
+  color: #feb2b2;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-sidebar-forfeit:hover {
+  background-color: #742a2a;
+  color: #ffffff;
+}
+
+.drawer-backdrop {
   position: fixed;
   top: 0;
   left: 0;
   width: 100vw;
   height: 100vh;
-  background: rgba(0, 0, 0, 0.9);
+  background-color: rgba(0,0,0,0.5);
+  z-index: 9998;
+}
+
+/* SYSTEM INTERFACE GLOBAL OVERLAY CONFIRM MODALS */
+.confirm-modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: rgba(0,0,0,0.6);
+  z-index: 100000;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.confirm-modal-box {
+  background-color: #ffffff;
+  border-radius: 12px;
+  padding: 24px;
+  width: 100%;
+  max-width: 400px;
+  box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1);
+}
+
+.confirm-modal-box h3 { margin: 0 0 8px 0; color: #1a202c; font-size: 18px; font-weight: 700; }
+.confirm-modal-box p { margin: 0 0 20px 0; color: #4a5568; font-size: 14px; line-height: 1.4; }
+
+.modal-button-row { display: flex; gap: 8px; }
+.modal-btn { flex: 1; padding: 10px; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; }
+.btn-cancel { background: #eee; color: #333; }
+.btn-confirm-forfeit { background: #c62828; color: white; }
+
+/* BINGO CELEBRATION POPUPS */
+.bingo-popup-overlay {
+  position: fixed;
+  top: 20%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: linear-gradient(135deg, #ecc94b 0%, #d69e2e 100%);
+  padding: 20px 40px;
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.25), 0 0 0 4px rgba(255,255,255,0.2);
+  text-align: center;
+  z-index: 999999;
+  border: 1px solid #f6e05e;
+}
+
+.bingo-stars { font-size: 32px; display: block; margin-bottom: 4px; }
+.bingo-popup-overlay h2 { margin: 0; font-size: 36px; font-weight: 900; color: #1a202c; letter-spacing: 2px; text-shadow: 0 2px 4px rgba(255,255,255,0.4); }
+.bingo-popup-overlay p { margin: 4px 0 0 0; font-size: 14px; font-weight: 700; color: #2d3748; }
+
+/* --- VUE TRANSITIONS RULES ANIMATIONS --- */
+.fade-enter-active, .fade-leave-active { transition: opacity 0.3s; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+.dropdown-slide-enter-active, .dropdown-slide-leave-active { transition: all 0.2s ease; }
+.dropdown-slide-enter-from, .dropdown-slide-leave-to { opacity: 0; transform: translateY(-10px); }
+
+/* NEW OVERLAY SPIN LOADING STYLE SPECIFIC FOR LOADING OVERLAYS */
+.loading-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: rgba(0, 0, 0, 0.7);
   display: flex;
   justify-content: center;
   align-items: center;
   z-index: 999999;
-  backdrop-filter: blur(4px);
 }
 
-.reconnect-dots {
+.spinner-box {
+  background-color: #ffffff;
+  padding: 30px;
+  border-radius: 12px;
   display: flex;
-  gap: 8px;
-  margin-top: 12px;
+  flex-direction: column;
+  align-items: center;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
 }
 
-.reconnect-dots span {
-  width: 8px;
-  height: 8px;
-  background: #b71c1c;
+.spinner {
+  width: 40px;
+  height: 40px;
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid #3498db;
   border-radius: 50%;
-  animation: dotPulse 1.4s infinite ease-in-out both;
+  animation: spin-kf 1s linear infinite;
 }
 
-.reconnect-dots span:nth-child(1) { animation-delay: -0.32s; }
-.reconnect-dots span:nth-child(2) { animation-delay: -0.16s; }
-
-.reconnect-progress {
-  margin-top: 12px;
-  color: #ccc;
-  font-size: 12px;
-  font-family: monospace;
+.loading-text {
+  margin-top: 15px;
+  font-weight: 600;
+  color: #2c3e50;
+  font-size: 15px;
 }
-
-@keyframes dotPulse {
-  0%, 80%, 100% { transform: scale(0.6); opacity: 0.5; }
-  40% { transform: scale(1); opacity: 1; }
-}
-
-.btn-retry-manual {
-  margin-top: 20px;
-  padding: 8px 16px;
-  background: #fff;
-  color: #b71c1c;
-  border: none;
-  border-radius: 6px;
-  font-weight: bold;
-  cursor: pointer;
-  font-size: 14px;
-  transition: all 0.2s;
-}
-
-.btn-retry-manual:hover {
-  background: #b71c1c;
-  color: white;
-  transform: scale(1.05);
-}
-
-/* Modal Styles */
-.confirm-modal-backdrop { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0, 0, 0, 0.6); display: flex; justify-content: center; align-items: center; z-index: 99999; font-family: system-ui, sans-serif; }
-.confirm-modal-box { background: white; padding: 28px; border-radius: 12px; width: 90%; max-width: 420px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.25); animation: zoomPop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
-.warn-icon { font-size: 40px; margin-bottom: 12px; }
-.confirm-modal-box h3 { margin: 0 0 10px 0; font-size: 22px; color: #111; font-weight: bold; }
-.confirm-modal-box p { font-size: 14px; color: #555; line-height: 1.5; margin: 0 0 24px 0; }
-.modal-button-row { display: flex; gap: 12px; }
-.modal-btn { flex: 1; padding: 12px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 14px; transition: background 0.2s; }
-.btn-cancel { background: #e0e0e0; color: #333; }
-.btn-cancel:hover { background: #d5d5d5; }
-.btn-confirm-forfeit { background: #c62828; color: white; }
-.btn-confirm-forfeit:hover { background: #b71c1c; }
-
-/* Loading Overlay */
-.loading-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(255, 255, 255, 0.85); display: flex; justify-content: center; align-items: center; z-index: 999999; }
-.spinner-box { display: flex; flex-direction: column; align-items: center; gap: 16px; }
-.spinner { width: 50px; height: 50px; border: 5px solid #f3f3f3; border-top: 5px solid #b71c1c; border-radius: 50%; animation: spin 1s linear infinite; }
-.loading-text { font-size: 16px; font-weight: bold; color: #333; font-family: system-ui, sans-serif; margin: 0; }
-@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-
-/* Header Styles */
-.header-left-group, .header-right-group { display: flex; align-items: center; gap: 12px; }
-
-/* Bingo Popup */
-.bingo-popup-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.6); display: flex; justify-content: center; align-items: center; z-index: 99999; pointer-events: none; }
-.bingo-popup-content { background: linear-gradient(135deg, #ffca28, #ff8f00); padding: 32px 48px; border-radius: 16px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.3); animation: zoomPop 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275); color: #fff; }
-.bingo-popup-content h2 { font-size: 42px; margin: 8px 0; font-family: 'Georgia', serif; font-weight: 900; letter-spacing: 2px; text-shadow: 0 2px 4px rgba(0,0,0,0.2); }
-.bingo-popup-content p { margin: 0; font-weight: bold; font-size: 16px; }
-.bingo-stars { font-size: 36px; }
-
-.fade-enter-active, .fade-leave-active { transition: opacity 0.25s ease; }
-.fade-enter-from, .fade-leave-to { opacity: 0; }
-@keyframes zoomPop { from { transform: scale(0.7); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-
-/* Sidebar Styles */
-.sandwich-trigger { background: transparent; border: none; cursor: pointer; display: flex; flex-direction: column; gap: 5px; padding: 8px; justify-content: center; z-index: 10; }
-.sandwich-trigger .bar { width: 24px; height: 3px; background-color: #333; border-radius: 2px; transition: 0.3s; }
-.sandwich-trigger:hover .bar { background-color: #b71c1c; }
-
-.sandwich-sidebar { position: fixed; top: 0; left: -320px; width: 320px; height: 100%; background: #ffffff; box-shadow: 4px 0 24px rgba(0,0,0,0.15); transition: transform 0.3s cubic-bezier(0.77,0.2,0.05,1.0); z-index: 1000; display: flex; flex-direction: column; text-align: left; }
-.sandwich-sidebar.drawer-open { transform: translateX(320px); }
-.drawer-backdrop { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0, 0, 0, 0.4); z-index: 999; }
-
-.drawer-header { padding: 20px; background: #b71c1c; color: white; display: flex; justify-content: space-between; align-items: center; }
-.drawer-header h3 { margin: 0; font-size: 18px; font-weight: bold; }
-.close-btn { background: transparent; border: none; color: white; font-size: 20px; cursor: pointer; }
-.drawer-body { padding: 20px; flex: 1; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
-
-.bag-counter-card { background: #f5f5f5; border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px; display: flex; justify-content: center; text-align: center; }
-.bag-stat { display: flex; flex-direction: column; align-items: center; gap: 6px; }
-.bag-qty { font-size: 36px; font-weight: 900; color: #b71c1c; }
-.bag-lbl { font-size: 13px; color: #666; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-
-.history-section h4 { border-bottom: 2px solid #f5f5f5; padding-bottom: 8px; margin: 0 0 10px 0; font-size: 14px; color: #444; text-transform: uppercase; letter-spacing: 0.5px; }
-.history-timeline { display: flex; flex-direction: column; gap: 8px; max-height: 400px; overflow-y: auto; }
-.timeline-log-row { font-size: 13px; color: #555; background: #fafafa; border-left: 3px solid #b71c1c; padding: 6px 10px; border-radius: 0 4px 4px 0; line-height: 1.4; }
-.empty-history { font-size: 13px; color: #999; text-align: center; padding: 20px 0; }
-
-.sidebar-footer-actions { border-top: 2px solid #f5f5f5; padding-top: 16px; margin-top: auto; }
-.btn-sidebar-forfeit { background: #fff5f5; color: #c62828; border: 1px solid #ffcdd2; width: 100%; padding: 12px; font-size: 14px; font-weight: bold; border-radius: 6px; cursor: pointer; text-align: center; transition: background 0.2s; }
-.btn-sidebar-forfeit:hover { background: #ffebee; }
-
-/* Game Styles */
-.brand-title { color: #b71c1c; font-family: 'Georgia', serif; font-weight: 900; font-size: 42px; margin: 0 0 4px 0; letter-spacing: -1px; }
-
-.board-wrapper { position: relative; max-width: 100%; display: inline-block; margin: 0 auto; }
-.tile-point-indicators { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; }
-.indicator-row { display: flex; flex: 1; }
-.indicator-cell { flex: 1; position: relative; }
-.draggable-board-surface-node { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: auto; cursor: grab; }
-.draggable-board-surface-node:active { cursor: grabbing; }
-.board-pts-badge { position: absolute; bottom: 2px; right: 3px; font-size: 8px; font-weight: bold; color: #444; font-family: sans-serif; background: rgba(255,255,255,0.85); padding: 0px 2px; border-radius: 2px; line-height: 1; }
-
-.notification-center { max-width: 600px; margin: 0 auto 16px auto; display: flex; flex-direction: column; gap: 8px; }
-.join-alert { background: #e3f2fd; color: #0d47a1; padding: 8px 12px; border-radius: 6px; font-size: 13px; font-weight: 500; text-align: center; }
-.play-alert { background: #fff8e1; color: #b7791f; padding: 10px 14px; border-radius: 6px; font-size: 14px; text-align: center; border: 1px dashed #ffe082; }
-.bold-log { font-weight: bold; color: #333; text-transform: capitalize; }
-
-.turn-confirmation-bar { display: flex; gap: 12px; justify-content: center; max-width: 600px; margin: 12px auto; }
-.btn-success { background: #2e7d32; color: white; flex: 1; padding: 12px; font-size: 15px; }
-.btn-success:hover { background: #1b5e20; }
-.btn-danger { background: #c62828; color: white; padding: 12px 20px; font-size: 15px; }
-
-.lobby-container { display: flex; justify-content: center; align-items: center; min-height: 80vh; font-family: system-ui, sans-serif; }
-.lobby-card { background: white; padding: 32px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); width: 100%; max-width: 400px; text-align: center; }
-.subtitle { color: #666; font-size: 14px; margin-bottom: 24px; }
-.error-banner { background: #ffebee; color: #c62828; padding: 10px; border-radius: 6px; margin-bottom: 16px; }
-.input-group { text-align: left; margin-bottom: 20px; }
-.input-group label { display: block; font-size: 13px; font-weight: bold; margin-bottom: 6px; }
-.input-group input, .code-input { width: 100%; padding: 12px; border: 2px solid #ddd; border-radius: 6px; font-size: 16px; box-sizing: border-box; }
-.divider { border: 0; border-top: 1px solid #eee; margin: 24px 0; }
-.lobby-actions { display: flex; flex-direction: column; gap: 16px; }
-.btn-block { width: 100%; padding: 14px; }
-.join-zone { display: flex; gap: 8px; }
-.code-input { flex: 1; text-transform: uppercase; text-align: center; }
-
-.container { max-width: 900px; margin: 0 auto; padding: 16px; text-align: center; }
-.game-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 12px; gap: 12px; }
-.room-highlight { color: #1f8ceb; font-weight: 800; background: #e3f2fd; padding: 2px 8px; border-radius: 4px; }
-.turn-indicator { padding: 6px 16px; border-radius: 20px; background: #e0e0e0; font-weight: bold; color: #666; font-size: 14px; }
-.turn-indicator.your-turn { background: #4caf50; color: white; animation: pulse 2s infinite; }
-.rack-wrapper { max-width: 600px; margin: 16px auto; }
-.rack-label { font-size: 14px; color: #555; text-align: left; }
-.rack { display: flex; gap: 8px; justify-content: center; background: #eae2d2; padding: 12px; border-radius: 8px; min-height: 56px; }
-.disabled-rack { opacity: 0.6; pointer-events: none; }
-.controls { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; max-width: 600px; margin: 20px auto; background: #f9f9f9; padding: 16px; border-radius: 8px; border: 1px solid #eee; text-align: left; }
-.player-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; color: #555; }
-.active-player { font-weight: bold; color: #000; }
-.active-player .dot { color: #4caf50; }
-.p-score { margin-left: auto; }
-.actions { display: flex; flex-direction: column; gap: 10px; }
-.btn { padding: 10px 16px; border-radius: 6px; border: none; font-weight: bold; cursor: pointer; }
-.btn:disabled { background: #dcdcdc !important; color: #999 !important; }
-.btn-primary { background: #1f8ceb; color: white; }
-.btn-alt { background: #e0e0e0; color: #333; }
-@keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.03); } 100% { transform: scale(1); } }
 </style>
