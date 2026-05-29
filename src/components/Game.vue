@@ -78,11 +78,23 @@ async function validateWords(moves) {
   }
 }
 
+// --- BROWSER REFRESH PERSISTENCE LOGIC ---
+async function checkAndReconnect() {
+  const savedRoomCode = localStorage.getItem('activeScrabbleRoom')
+  if (savedRoomCode) {
+    inputRoomCode.value = savedRoomCode
+    playerName.value = profileData.value.username || 'Player'
+    if (playerName.value) {
+      await handleJoinRoom()
+    }
+  }
+}
+
 // Check active session on load with timeout
 onMounted(async () => {
   document.addEventListener('click', handleOutsideClick)
   
-  const loadTimeout = setTimeout(() => {
+  const loadTimeout = setTimeout(async () => {
     if (isLoadingProfile.value || isProcessing.value || isRoomLoading.value) {
       console.warn('Profile loading timeout - proceeding with fallback')
       isLoadingProfile.value = false
@@ -96,12 +108,11 @@ onMounted(async () => {
         profileData.value = { username: 'Guest', wins: 0, losses: 0 }
         playerName.value = 'Guest'
       }
+      await checkAndReconnect()
     }
   }, 5000)
   
   try {
-    localStorage.removeItem('scrabble_room')
-
     const { data: { session }, error } = await supabase.auth.getSession()
     clearTimeout(loadTimeout)
     
@@ -111,12 +122,16 @@ onMounted(async () => {
       isLoadingProfile.value = false
       isProcessing.value = false
     }
+    
+    await checkAndReconnect()
+
   } catch (err) {
     clearTimeout(loadTimeout)
     console.error('Session check error:', err)
     isLoadingProfile.value = false
     isProcessing.value = false
     profileData.value = { username: 'Guest', wins: 0, losses: 0 }
+    await checkAndReconnect()
   }
 })
 
@@ -327,8 +342,8 @@ const LETTER_SCORES = {
   N:1, O:1, P:3, Q:10, R:1, S:1, T:1, U:1, V:4, W:4, X:8, Y:4, Z:10
 }
 const LETTER_COUNTS = {
-  A:9, B:2, C:2, D:4, E:12, F:2, G:3, H:2, I:9, J:1, K:1, L:4, M:2,
-  N:6, O:8, P:2, Q:1, R:6, S:4, T:6, U:4, V:2, W:2, X:1, Y:2, Z:1
+  A:10, B:2, C:2, D:4, E:15, F:2, G:3, H:2, I:10, J:1, K:1, L:4, M:2,
+  N:8, O:10, P:2, Q:1, R:8, S:6, T:8, U:5, V:2, W:2, X:1, Y:2, Z:1
 }
 
 const TILE_MULTIPLIERS = (() => {
@@ -607,7 +622,9 @@ async function handleCreateRoom() {
   isRoomLoading.value = true
   loadingMessage.value = "Creating game room..."
   
-  const newRoomCode = Math.random().toString(36).substring(2, 8).padEnd(6, '0').toUpperCase()
+  const newRoomCode = Array.from({ length: 6 }, () => 
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".charAt(Math.floor(Math.random() * 36))
+  ).join('');
   const freshBag = createOfficialBag()
   const initialRack = drawSmartTiles([...freshBag], 7)
   const username = playerName.value.trim()
@@ -642,6 +659,10 @@ async function handleCreateRoom() {
     room.value = newRoomCode
     isJoined.value = true
     gameDataLoaded = false
+    
+    // Drop the persistence anchor
+    localStorage.setItem('activeScrabbleRoom', newRoomCode)
+    
     addToHistory(username, 'game_started', 'Game created', null)
 
     await startSupabaseSubscription(newRoomCode, fallbackRow) 
@@ -673,8 +694,8 @@ async function handleJoinRoom() {
   loadingMessage.value = "Joining game room..."
   
   try {
-    const activeUrl = supabase.supabaseUrl || supabaseUrl
-    const activeKey = supabase.supabaseKey || supabaseKey
+    const activeUrl = supabaseUrl
+    const activeKey = supabaseKey
 
     if (!activeUrl || !activeKey) {
       throw new Error("Supabase environment configuration keys are missing or undefined.")
@@ -697,10 +718,17 @@ async function handleJoinRoom() {
 
     if (!gameData) {
       errorMessage.value = "Room code not found!"
+      isRoomLoading.value = false
       return
     }
     
-    let currentPlayers = [...(gameData.players_json || [])]
+    let currentPlayers = []
+    if (gameData.players_json) {
+      currentPlayers = typeof gameData.players_json === 'string' 
+        ? JSON.parse(gameData.players_json) 
+        : [...gameData.players_json]
+    }
+
     const username = playerName.value.trim()
     const currentUserId = currentUser.value?.id || sessionGuestId.value
     const alreadyIn = currentPlayers.some(p => p.id === currentUserId)
@@ -709,35 +737,43 @@ async function handleJoinRoom() {
       room.value = code
       isJoined.value = true
       gameDataLoaded = false
+      localStorage.setItem('activeScrabbleRoom', code)
+      
       profileData.value.username = currentPlayers.find(p => p.id === currentUserId).name
       addToHistory(profileData.value.username, 'reconnected', `${profileData.value.username} reconnected`, null)
-      
       await startSupabaseSubscription(code, gameData)
       return
     }
     
     if (currentPlayers.length >= 2) {
       errorMessage.value = "This match room is full."
+      isRoomLoading.value = false
       return
     }
     
-    let currentBag = [...(gameData.tile_bag || [])]
+    let currentBag = []
+    if (gameData.tile_bag) {
+      currentBag = typeof gameData.tile_bag === 'string'
+        ? JSON.parse(gameData.tile_bag)
+        : [...gameData.tile_bag]
+    }
+
     const startingRack = drawSmartTiles(currentBag, 7)
-    currentPlayers.push({ 
+
+    const newPlayerNode = { 
       id: currentUserId, 
       name: username, 
-      rack: startingRack, 
+      rack: JSON.parse(JSON.stringify(startingRack)), 
       score: 0 
-    })
-    
+    }
+
+    currentPlayers.push(newPlayerNode)
+
     const patchUrl = `${activeUrl}/rest/v1/games?room_code=eq.${code}`
     const updatedPayload = {
-      players_json: currentPlayers,
+      players_json: JSON.parse(JSON.stringify(currentPlayers)),
       tile_bag: currentBag,
-      guest_id: currentUserId,
-      status: 'active',
-      join_notification: `${username} has joined!`,
-      updated_at: new Date().toISOString()
+      status: 'active'
     }
 
     const patchResponse = await fetch(patchUrl, {
@@ -751,7 +787,10 @@ async function handleJoinRoom() {
       body: JSON.stringify(updatedPayload)
     })
 
-    if (!patchResponse.ok) throw new Error(`Room update failed with status: ${patchResponse.status}`)
+    if (!patchResponse.ok) {
+      const errDetails = await patchResponse.text()
+      throw new Error(`Room update failed with status: ${patchResponse.status}. Details: ${errDetails}`)
+    }
     
     const patchDataText = await patchResponse.text()
     let patchJson = patchDataText ? JSON.parse(patchDataText) : null
@@ -760,43 +799,31 @@ async function handleJoinRoom() {
     room.value = code
     isJoined.value = true
     gameDataLoaded = false
-    addToHistory(username, 'joined', `${username} joined the game`, null)
+    localStorage.setItem('activeScrabbleRoom', code)
     
+    addToHistory(username, 'joined', `${username} joined the game`, null)
     await startSupabaseSubscription(code, updatedRow || gameData)
     
   } catch (err) {
     console.error('Join room network execution error:', err)
-    errorMessage.value = `Failed to join room securely: ${err.message || 'Check connection'}`
+    errorMessage.value = `Failed to join room cleanly: ${err.message}`
   } finally {
     isRoomLoading.value = false
     loadingMessage.value = ''
   }
 }
 
-function stopGamePolling() {
-  if (gamePollInterval) {
-    clearInterval(gamePollInterval)
-    gamePollInterval = null
-  }
-}
-
-function startGamePolling(roomCode) {
-  if (gamePollInterval) return
-  console.warn('Starting fallback polling for room state because realtime may be unavailable.', roomCode)
-  gamePollInterval = setInterval(async () => {
-    try {
-      const data = await findExistingRoom(roomCode)
-      if (data) {
-        syncStateMap(data)
-      }
-    } catch (pollErr) {
-      console.warn('Fallback poll error for room', roomCode, pollErr)
-    }
-  }, 5000)
-}
-
 async function startSupabaseSubscription(roomCode, initialData = null) {
-  stopGamePolling()
+  console.log('startSupabaseSubscription called for', roomCode)
+  
+  try {
+    if (typeof pollingInterval !== 'undefined' && pollingInterval) {
+      clearInterval(pollingInterval)
+      pollingInterval = null
+    }
+  } catch (pollingErr) {
+    console.log('Poller cleanup bypassed safely')
+  }
 
   if (gameChannel) {
     try {
@@ -830,6 +857,27 @@ async function startSupabaseSubscription(roomCode, initialData = null) {
     
     syncStateMap(data)
 
+    gameChannel = supabase
+      .channel(`room-${roomCode}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'games',
+          filter: `room_code=eq.${roomCode}`
+        },
+        (payload) => {
+          console.log('⚡ Realtime Update Received!', payload.new)
+          if (payload.new) {
+            syncStateMap(payload.new)
+          }
+        }
+      )
+      .subscribe((status) => {
+        console.log(`Subscription status for ${roomCode}:`, status)
+      })
+
   } catch (err) {
     console.error('Fatal error setting up subscription:', err)
     errorMessage.value = "Error connecting to realtime server. Falling back to polling."
@@ -839,16 +887,32 @@ async function startSupabaseSubscription(roomCode, initialData = null) {
 
 function syncStateMap(data) {
   if (!data) return
-  boardFlat.value = Array.isArray(data.board_state) ? data.board_state : Array(225).fill('')
-  bag.value = Array.isArray(data.tile_bag) ? data.tile_bag : []
-  players.value = Array.isArray(data.players_json) ? data.players_json : []
   
+  boardFlat.value = Array.isArray(data.board_state) 
+    ? data.board_state 
+    : (typeof data.board_state === 'string' ? JSON.parse(data.board_state) : Array(225).fill(''))
+    
+  bag.value = Array.isArray(data.tile_bag) 
+    ? data.tile_bag 
+    : (typeof data.tile_bag === 'string' ? JSON.parse(data.tile_bag) : [])
+    
+  const parsedPlayers = Array.isArray(data.players_json) 
+    ? data.players_json 
+    : (typeof data.players_json === 'string' ? JSON.parse(data.players_json) : [])
+    
+  players.value = parsedPlayers
+
   joinMessage.value = data.join_notification || ''
   latestPlayMessage.value = data.latest_play || ''
   
   if (players.value.length > 0 && data.current_turn_name) {
     const idx = players.value.findIndex(p => p.name === data.current_turn_name)
     currentPlayerIndex.value = idx !== -1 ? idx : 0
+  }
+
+  if (players.value.length >= 2 && data.status === 'active') {
+    isJoined.value = true
+    errorMessage.value = ""
   }
 
   if (data.status === 'finished' && currentUser.value) {
@@ -864,6 +928,34 @@ function syncStateMap(data) {
       })
   }
   gameDataLoaded = true
+}
+
+function updateLocalGameState(record) {
+  if (!record) return
+
+  let parsedPlayers = []
+  if (record.players_json) {
+    parsedPlayers = typeof record.players_json === 'string'
+      ? JSON.parse(record.players_json)
+      : record.players_json
+  }
+  players.value = Array.isArray(parsedPlayers) ? parsedPlayers : []
+  
+  let parsedBag = []
+  if (record.tile_bag) {
+    parsedBag = typeof record.tile_bag === 'string'
+      ? JSON.parse(record.tile_bag)
+      : record.tile_bag
+  }
+  bag.value = Array.isArray(parsedBag) ? parsedBag : []
+
+  if (record.join_notification) joinMessage.value = record.join_notification
+  if (record.latest_play) latestPlayMessage.value = record.latest_play
+
+  if (players.value.length > 0 && record.current_turn_name) {
+    const idx = players.value.findIndex(p => p.name === record.current_turn_name)
+    currentPlayerIndex.value = idx !== -1 ? idx : 0
+  }
 }
 
 // --- CONFIRM AND COMMIT GAME TURN ENGINE ---
@@ -1118,6 +1210,7 @@ function resetLocalState() {
   gameHistory.value = []
   errorMessage.value = ''
   gameDataLoaded = false
+  localStorage.removeItem('activeScrabbleRoom')
   if (gameChannel) {
     supabase.removeChannel(gameChannel)
     gameChannel = null
@@ -1145,16 +1238,27 @@ const localPlayerIndex = computed(() => {
   return players.value.findIndex(p => p.id === currentUserId)
 })
 const isMyTurn = computed(() => {
-  if (!players.value.length || players.value.length < 2 || localPlayerIndex.value === -1) return false
+  if (!players.value || players.value.length < 2 || localPlayerIndex.value === -1) return false
   return localPlayerIndex.value === currentPlayerIndex.value
 })
 const myRack = computed(() => {
+  if (localPlayerIndex.value === -1) return []
+  
   const me = players.value[localPlayerIndex.value]
   if (!me || !me.rack || !Array.isArray(me.rack)) return []
-  let workingRack = me.rack.map((t, index) => ({ letter: t.letter || t, pts: t.pts || 0, rackId: index }))
+  
+  let workingRack = me.rack.map((t, index) => {
+    const letterStr = typeof t === 'object' ? (t.letter || '') : t;
+    const pointsNum = typeof t === 'object' ? (t.pts || LETTER_SCORES[letterStr] || 0) : (LETTER_SCORES[t] || 0);
+    return {
+      letter: letterStr,
+      pts: pointsNum,
+      rackId: index
+    }
+  })
+
   const usedIndices = new Set(pendingMoves.value.map(m => m.rackId).filter(id => id !== undefined))
-  workingRack = workingRack.filter((_, idx) => !usedIndices.has(idx))
-  return workingRack
+  return workingRack.filter((_, idx) => !usedIndices.has(idx))
 })
 </script>
 
@@ -1350,7 +1454,7 @@ const myRack = computed(() => {
       <div class="drawer-body">
         <div class="bag-counter-card">
           <div class="bag-stat">
-            <span class="bag-qty">{{ bag.length }}</span>
+            <span class="bag-qty">{{ bag?.length || 0 }}</span>
             <span class="bag-lbl">Remaining Tiles</span>
           </div>
         </div>
@@ -1373,7 +1477,7 @@ const myRack = computed(() => {
                 +{{ log.scoreChange }}
               </span>
             </div>
-            <div v-if="!gameHistory.length" class="empty-history">
+            <div v-if="!gameHistory?.length" class="empty-history">
               No moves registered in this match session yet.
             </div>
           </div>
@@ -1403,23 +1507,34 @@ const myRack = computed(() => {
           </div>
         </div>
 
-        <div class="arena-scoreboard">
-          <div v-for="(p, index) in players" :key="p.id || index" :class="['score-pill', { 'active-turn-indicator': index === currentPlayerIndex, 'is-me-pill': p.id === (currentUser?.id || sessionGuestId) }]">
-            <span class="turn-dot"></span>
-            <span class="player-name">{{ p.name }}</span>
-            <span class="player-score">{{ p.score }} pts</span>
-          </div>
-        </div>
-
         <div class="bar-right-actions">
-          <div class="live-status-ticker">
-            <span class="pulse-indicator"></span>
-            <p class="ticker-message">{{ latestPlayMessage || joinMessage || 'Waiting for gameplay turns...' }}</p>
+          <div class="turn-status-ticker" :class="{ 'my-active-turn': isMyTurn, 'opponent-turn': !isMyTurn }">
+            <span v-if="isMyTurn" class="turn-badge">Your Turn</span>
+            <span v-else class="turn-badge">
+              {{ players[currentPlayerIndex]?.name || 'Opponent' }}'s Turn
+            </span>
           </div>
         </div>
       </header>
 
       <main class="arena-layout-plane">
+        <div class="live-move-ticker-box">
+          <div class="ticker-header-bar">
+            <span class="ticker-dot">●</span> <span>Match Activity Log</span>
+          </div>
+          <div class="ticker-body">
+            <p v-if="latestPlayMessage" class="ticker-text-line">
+              ✨ {{ latestPlayMessage }}
+            </p>
+            <p v-else-if="joinMessage" class="ticker-text-line">
+              👋 {{ joinMessage }}
+            </p>
+            <p v-else class="ticker-empty-line">
+              🎮 Match started. Waiting for the opening tile placement move...
+            </p>
+          </div>
+        </div>
+
         <div class="board-wrapper">
           <div class="board-wrapper-frame">
             <Board :board="board2D" :pending-moves="pendingMoves" @cell-click="onCellClick" @drop-tile="handleDrop" @dragstart-placed="onBoardTileDragStart" />
@@ -1449,18 +1564,18 @@ const myRack = computed(() => {
 
               <div class="actions">
                 <div class="action-button-matrix-row">
-                  <button class="control-btn play-turn-btn" @click="confirmTurn" :disabled="!isMyTurn || pendingMoves.length === 0">
+                  <button class="control-btn play-turn-btn" @click="confirmTurn" :disabled="!isMyTurn || pendingMoves?.length === 0">
                     🚀 Play Turn
                   </button>
-                  <button class="control-btn utility-btn" @click="recallTiles" :disabled="pendingMoves.length === 0">
+                  <button class="control-btn utility-btn" @click="recallTiles" :disabled="pendingMoves?.length === 0">
                     ↩️ Recall
                   </button>
                 </div>
                 <div class="action-button-matrix-row">
-                  <button class="control-btn utility-btn" @click="exchange" :disabled="!isMyTurn || pendingMoves.length > 0">
+                  <button class="control-btn utility-btn" @click="exchange" :disabled="!isMyTurn || pendingMoves?.length > 0">
                     🔄 Exchange
                   </button>
-                  <button class="control-btn utility-btn" @click="pass" :disabled="!isMyTurn || pendingMoves.length > 0">
+                  <button class="control-btn utility-btn" @click="pass" :disabled="!isMyTurn || pendingMoves?.length > 0">
                     ⏭️ Pass
                   </button>
                 </div>
@@ -2121,7 +2236,7 @@ const myRack = computed(() => {
   width: 100%;
   max-width: min(480px, 94vw);
   margin: 0 auto;
-  margin-bottom: 24px; /* Added an explicit, distinct space gap between board and tile rack buttons */
+  margin-bottom: 24px; 
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2618,11 +2733,11 @@ const myRack = computed(() => {
 
   .arena-layout-plane {
     padding: 12px 8px;
-    justify-content: flex-start; /* Stack items tightly starting from top */
+    justify-content: flex-start; 
   }
 
   .board-wrapper {
-    margin-bottom: 24px !important; /* Forces the physical layout engine to maintain a space gap below the board */
+    margin-bottom: 24px !important; 
   }
 
   .board-wrapper-frame {
@@ -2655,5 +2770,106 @@ const myRack = computed(() => {
     max-width: 100%;
     padding: 10px;
   }
+}
+/* --- PREVENT SIDEWAYS SCROLLING & FIX RESPONSIVENESS --- */
+html, body, #app {
+  max-width: 100vw;
+  overflow-x: hidden !important;
+  margin: 0;
+  padding: 0;
+}
+
+.arena-layout-container, .lobby-wrapper {
+  max-width: 100vw;
+  width: 100%;
+  overflow-x: hidden !important;
+  box-sizing: border-box;
+}
+
+/* --- DYNAMIC TURN TICKER --- */
+.turn-status-ticker {
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-weight: 700;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
+  transition: all 0.3s ease;
+}
+
+.turn-status-ticker.my-active-turn {
+  background-color: #2ecc71 !important;
+  color: #ffffff !important;
+  border: 1px solid #27ae60;
+  animation: pulse-glow 2s infinite;
+}
+
+.turn-status-ticker.opponent-turn {
+  background-color: #f1f2f6 !important;
+  color: #57606f !important;
+  border: 1px solid #ced6e0;
+}
+
+@keyframes pulse-glow {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(46, 204, 113, 0.4); }
+  70% { transform: scale(1.02); box-shadow: 0 0 0 8px rgba(46, 204, 113, 0); }
+  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(46, 204, 113, 0); }
+}
+
+/* --- REACTIVE LIVE ACTIVITY LOG STYLING --- */
+.live-move-ticker-box {
+  width: 100%;
+  max-width: 600px;
+  margin: 10px auto 14px auto;
+  background-color: #ffffff;
+  border: 1px solid #e1e8ed;
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+  overflow: hidden;
+}
+
+.ticker-header-bar {
+  background-color: #f8f9fa;
+  border-bottom: 1px solid #e1e8ed;
+  padding: 6px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #7f8c8d;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ticker-dot {
+  color: #e74c3c;
+  animation: blink 1.5s infinite;
+}
+
+.ticker-body {
+  padding: 12px 16px;
+  background: #fffdf9;
+}
+
+.ticker-text-line {
+  margin: 0;
+  font-size: 14px;
+  color: #2c3e50;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.ticker-empty-line {
+  margin: 0;
+  font-size: 13px;
+  color: #95a5a6;
+  font-style: italic;
+}
+
+@keyframes blink {
+  0% { opacity: 0.2; }
+  50% { opacity: 1; }
+  100% { opacity: 0.2; }
 }
 </style>
