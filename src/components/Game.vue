@@ -59,7 +59,6 @@ async function validateWords(moves) {
   if (words.length === 0) return true
 
   try {
-    // Single network round-trip validating every word concurrently via RPC
     const { data: invalidWords, error } = await supabase
       .rpc('validate_words_list', { input_words: words })
 
@@ -80,7 +79,6 @@ async function validateWords(moves) {
 }
 
 // Check active session on load with timeout
-// Check active session on load with timeout
 onMounted(async () => {
   document.addEventListener('click', handleOutsideClick)
   
@@ -89,7 +87,7 @@ onMounted(async () => {
       console.warn('Profile loading timeout - proceeding with fallback')
       isLoadingProfile.value = false
       profileLoadError.value = false
-      isProcessing.value = false // Kill the processing spinner if it stalls out here
+      isProcessing.value = false 
       isRoomLoading.value = false
       loadingMessage.value = ''
       if (!currentUser.value) {
@@ -202,7 +200,6 @@ async function handleUserSessionFetch(user) {
     }
     authUsername.value = ''
   } finally {
-    // Unconditionally release ALL login blockades
     isLoadingProfile.value = false
     profileLoadError.value = false
     isProcessing.value = false 
@@ -251,13 +248,10 @@ async function handleAuthAction() {
   } catch (err) {
     console.error("Authentication process caught error:", err)
     errorMessage.value = err.message || "An unexpected auth execution drop occurred."
-    
-    // CRITICAL FIXES FOR HANGING SPINNER:
     isLoadingProfile.value = false 
     isRoomLoading.value = false
     loadingMessage.value = ''
   } finally {
-    // THIS GUARANTEES THE "PROCESSING" SPINNER DISAPPEARS
     isProcessing.value = false
     isLoadingProfile.value = false
     isRoomLoading.value = false
@@ -376,7 +370,6 @@ function hasTwoLetterWord(tiles) {
   for (let i = 0; i < letters.length; i++) {
     for (let j = 0; j < letters.length; j++) {
       if (i === j) continue
-      // Standard 2-letter validation fallback dictionary reference array removed since RPC is active
       return true
     }
   }
@@ -600,7 +593,6 @@ async function findExistingRoom(roomCode) {
 
 // --- SUPABASE GAME EXECUTION ---
 async function handleCreateRoom() {
-  console.log('handleCreateRoom called', { playerName: playerName.value, isLoadingProfile: isLoadingProfile.value })
   if (isLoadingProfile.value) {
     errorMessage.value = "Still loading your profile. Please wait a moment..."
     return
@@ -621,7 +613,6 @@ async function handleCreateRoom() {
   const username = playerName.value.trim()
   
   try {
-    console.log('handleCreateRoom inserting game', { newRoomCode, playerName: username, currentUser: currentUser.value, profileUsername: profileData.value.username })
     if (currentUser.value && (!profileData.value.username || profileData.value.username === 'Guest')) {
       await supabase
         .from('profiles')
@@ -646,24 +637,14 @@ async function handleCreateRoom() {
       host_id: currentUser.value?.id || null,
       created_at: new Date().toISOString()
     }
-    console.log('Game insert payload', gameData)
 
     const fallbackRow = await rawInsertGame(gameData)
-const insertData = [fallbackRow]
-room.value = newRoomCode
-isJoined.value = true
-gameDataLoaded = false
-addToHistory(username, 'game_started', 'Game created', null)
-
-console.log('About to start subscription for', newRoomCode)
-    console.log('Game created successfully, updating local room state', { newRoomCode, insertData })
     room.value = newRoomCode
     isJoined.value = true
     gameDataLoaded = false
     addToHistory(username, 'game_started', 'Game created', null)
+
     await startSupabaseSubscription(newRoomCode, fallbackRow) 
-console.log('Subscription promise resolved for', newRoomCode)
-    console.log('Subscription promise resolved for', newRoomCode)
     
   } catch (err) {
     console.error('Create room error:', err)
@@ -692,7 +673,6 @@ async function handleJoinRoom() {
   loadingMessage.value = "Joining game room..."
   
   try {
-    // Dynamically resolve your project credentials straight from the client instance
     const activeUrl = supabase.supabaseUrl || supabaseUrl
     const activeKey = supabase.supabaseKey || supabaseKey
 
@@ -700,7 +680,6 @@ async function handleJoinRoom() {
       throw new Error("Supabase environment configuration keys are missing or undefined.")
     }
 
-    // 1. Direct Fetch GET Request to locate the room
     const getUrl = `${activeUrl}/rest/v1/games?room_code=eq.${code}`
     const getResponse = await fetch(getUrl, {
       method: 'GET',
@@ -726,7 +705,6 @@ async function handleJoinRoom() {
     const currentUserId = currentUser.value?.id || sessionGuestId.value
     const alreadyIn = currentPlayers.some(p => p.id === currentUserId)
     
-    // Check if player is already registered in this room session
     if (alreadyIn) {
       room.value = code
       isJoined.value = true
@@ -743,7 +721,6 @@ async function handleJoinRoom() {
       return
     }
     
-    // Draw initial tiles for the joining player
     let currentBag = [...(gameData.tile_bag || [])]
     const startingRack = drawSmartTiles(currentBag, 7)
     currentPlayers.push({ 
@@ -753,7 +730,6 @@ async function handleJoinRoom() {
       score: 0 
     })
     
-    // 2. Direct Fetch PATCH Request to update the game room state
     const patchUrl = `${activeUrl}/rest/v1/games?room_code=eq.${code}`
     const updatedPayload = {
       players_json: currentPlayers,
@@ -770,7 +746,7 @@ async function handleJoinRoom() {
         'apikey': activeKey,
         'Authorization': `Bearer ${activeKey}`,
         'Content-Type': 'application/json',
-        'Prefer': 'return=representation' // Requests the updated row back from PostgREST
+        'Prefer': 'return=representation'
       },
       body: JSON.stringify(updatedPayload)
     })
@@ -781,13 +757,11 @@ async function handleJoinRoom() {
     let patchJson = patchDataText ? JSON.parse(patchDataText) : null
     const updatedRow = Array.isArray(patchJson) ? patchJson[0] : patchJson
 
-    // Apply states locally
     room.value = code
     isJoined.value = true
     gameDataLoaded = false
     addToHistory(username, 'joined', `${username} joined the game`, null)
     
-    // Feed the fresh data directly to subscription so it doesn't need to perform any blocking fetches
     await startSupabaseSubscription(code, updatedRow || gameData)
     
   } catch (err) {
@@ -813,7 +787,6 @@ function startGamePolling(roomCode) {
     try {
       const data = await findExistingRoom(roomCode)
       if (data) {
-        console.log('Fallback poll loaded game state for', roomCode)
         syncStateMap(data)
       }
     } catch (pollErr) {
@@ -823,7 +796,6 @@ function startGamePolling(roomCode) {
 }
 
 async function startSupabaseSubscription(roomCode, initialData = null) {
-  console.log('startSupabaseSubscription called for', roomCode)
   stopGamePolling()
 
   if (gameChannel) {
@@ -835,7 +807,6 @@ async function startSupabaseSubscription(roomCode, initialData = null) {
     gameChannel = null
   }
   
-  // 1. THIS IS THE TRY BLOCK THAT WAS OPENED
   try {
     let data = initialData
     
@@ -848,10 +819,7 @@ async function startSupabaseSubscription(roomCode, initialData = null) {
         
       data = response.data
       const error = response.error
-      console.log('Subscription initial game fetch', { roomCode, data, error })
       if (error && error.code !== 'PGRST116') throw error
-    } else {
-      console.log('Subscription using pre-provided initial game data', roomCode)
     }
     
     if (!data) {
@@ -862,13 +830,6 @@ async function startSupabaseSubscription(roomCode, initialData = null) {
     
     syncStateMap(data)
 
-    // --- YOUR REALTME CHANNELS & SUBSCRIPTION CODE GOES HERE ---
-    // Example:
-    // gameChannel = supabase.channel(...)
-    // .on(...)
-    // .subscribe()
-
-  // 2. YOU MUST INCLUDE THIS CATCH BLOCK TO COMPLY WITH THE OPENED TRY
   } catch (err) {
     console.error('Fatal error setting up subscription:', err)
     errorMessage.value = "Error connecting to realtime server. Falling back to polling."
@@ -1007,7 +968,6 @@ async function confirmForfeit() {
     const currentUsername = profileData.value.username || 'Player'
     addToHistory(currentUsername, 'forfeited', `${currentUsername} forfeited the game`, null)
     
-    // Explicitly shut down real-time channels first
     if (gameChannel) {
       try {
         await supabase.removeChannel(gameChannel)
@@ -1017,7 +977,6 @@ async function confirmForfeit() {
       gameChannel = null
     }
 
-    // Direct REST API DELETE request bypassing the Supabase client wrapper
     const url = `${supabaseUrl}/rest/v1/games?room_code=eq.${room.value}`
     const response = await fetch(url, {
       method: 'DELETE',
@@ -1032,13 +991,11 @@ async function confirmForfeit() {
       throw new Error(`Forfeit network request failed with status: ${response.status}`)
     }
     
-    // Successfully deleted from database, now clear local UI state
     resetLocalState()
     
   } catch (err) {
     console.error('Forfeit execution error:', err)
     errorMessage.value = "Failed to forfeit game safely. Forcing exit..."
-    // Force local exit even if network fails so the player isn't stuck
     resetLocalState()
   } finally {
     isProcessing.value = false
@@ -1534,7 +1491,6 @@ const myRack = computed(() => {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
-/* TOP LOBBY HEADER BAR BRANDING ELEMENTS */
 .lobby-brand-bar {
   display: flex;
   justify-content: space-between;
@@ -1577,7 +1533,6 @@ const myRack = computed(() => {
   color: #e67e22;
 }
 
-/* AUTHENTICATED WORKSPACE USER ACCREDITATION COMPONENT */
 .user-profile-widget {
   position: relative;
   z-index: 1001;
@@ -1625,7 +1580,6 @@ const myRack = computed(() => {
   color: #7f8c8d;
 }
 
-/* INTERACTIVE ACCOUNT DROPDOWN OVERLAYS */
 .profile-dropdown {
   position: absolute;
   top: calc(100% + 8px);
@@ -1721,7 +1675,6 @@ const myRack = computed(() => {
   border-color: #e74c3c;
 }
 
-/* LOBBY INTERFACE CONTENT CARD WRAPPERS */
 .lobby-content-container {
   flex: 1;
   display: flex;
@@ -1760,7 +1713,6 @@ const myRack = computed(() => {
   line-height: 1.4;
 }
 
-/* INPUT COMPONENT FORM ELEMENTS */
 .form-body {
   display: flex;
   flex-direction: column;
@@ -1802,9 +1754,8 @@ const myRack = computed(() => {
 .text-center { text-align: center; }
 .font-bold { font-weight: 700; }
 .font-lg { font-size: 18px; }
-.uppercase { transform: uppercase; }
+.uppercase { text-transform: uppercase; }
 
-/* ERROR ALERT MESSAGE BANNERS */
 .error-banner-alert {
   background-color: #fdf2e9;
   border-left: 4px solid #e67e22;
@@ -1819,7 +1770,6 @@ const myRack = computed(() => {
   margin-bottom: 24px;
 }
 
-/* BUTTON ACTION FORM ELEMENTS */
 .base-action-btn {
   width: 100%;
   padding: 14px 24px;
@@ -1905,7 +1855,6 @@ const myRack = computed(() => {
   cursor: not-allowed;
 }
 
-/* SPINNER ELEMENTS FOR CARD ACTIONS */
 .central-spinner-layout {
   display: flex;
   flex-direction: column;
@@ -1937,7 +1886,6 @@ const myRack = computed(() => {
   100% { transform: rotate(360deg); }
 }
 
-/* LOBBY SPLIT CARD MODULE ACTIONS */
 .workspace-action-split {
   display: flex;
   align-items: center;
@@ -1955,7 +1903,7 @@ const myRack = computed(() => {
   align-items: center;
   justify-content: center;
   position: relative;
-  align-self: stroke;
+  align-self: stretch;
 }
 
 .split-vertical-divider::before {
@@ -2006,7 +1954,6 @@ const myRack = computed(() => {
   overflow: hidden;
 }
 
-/* ARENA SYSTEM STAT TICKER BAR MODULES */
 .arena-status-bar {
   height: 64px;
   background-color: #1a252f;
@@ -2016,6 +1963,7 @@ const myRack = computed(() => {
   align-items: center;
   padding: 0 24px;
   box-sizing: border-box;
+  flex-shrink: 0;
 }
 
 .bar-left-cluster {
@@ -2024,7 +1972,6 @@ const myRack = computed(() => {
   gap: 16px;
 }
 
-/* DRAWER MENU SANDWICH TOGGLE TRIGGER BUTTON */
 .sandwich-trigger {
   background: none;
   border: none;
@@ -2060,7 +2007,6 @@ const myRack = computed(() => {
   letter-spacing: 0.5px;
 }
 
-/* MATCH ARENA REALTIME SCOREBOARD PILLS */
 .arena-scoreboard {
   display: flex;
   gap: 12px;
@@ -2162,22 +2108,24 @@ const myRack = computed(() => {
   flex-direction: column;
   justify-content: flex-start;
   align-items: center;
-  padding: 12px;
+  padding: 16px;
   box-sizing: border-box;
   overflow-y: auto;
   overflow-x: hidden;
   width: 100%;
 }
 
-/* BOARD WORKSPACE ADAPTIVE OVERFLOW BOUNDS */
+/* BOARD WORKSPACE BOUNDS */
 .board-wrapper { 
   position: relative; 
   width: 100%;
   max-width: min(480px, 94vw);
-  margin: 0 auto 16px auto;
+  margin: 0 auto;
+  margin-bottom: 24px; /* Added an explicit, distinct space gap between board and tile rack buttons */
   display: flex;
   flex-direction: column;
   align-items: center;
+  flex-shrink: 0;
 }
 
 .board-wrapper-frame {
@@ -2185,30 +2133,22 @@ const myRack = computed(() => {
   justify-content: center;
   align-items: center;
   width: 100%;
-  margin-bottom: 0px !important;
 }
 
-/* INTERACTION CONSOLE CONTROL LABELS & INTEGRATED SIDE DASHBOARD */
+/* INTERACTION INTERFACES UNDERNEATH THE BOARD */
 .player-interaction-dock {
   width: 100%;
   max-width: 480px;
-  margin-top: 8px;
   flex-shrink: 0;
+  margin-top: 0;
 }
 
 .interaction-dock-inner {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
+  gap: 16px;
   width: 100%;
-}
-
-/* WOOD SHELF TILES CONTROLLER TRACKS */
-.rack-wrapper { 
-  width: 100%;
-  max-width: 100%; 
-  margin: 0 auto 12px auto;
 }
 
 .rack-outer-frame {
@@ -2221,7 +2161,7 @@ const myRack = computed(() => {
   border-top: 1px solid #f6e05e;
   border-bottom: 2px solid #744210;
   border-radius: 4px;
-  padding: 6px 12px;
+  padding: 8px 12px;
   box-shadow: 0 6px 10px rgba(0,0,0,0.3), inset 0 1px 2px rgba(255,255,255,0.2);
   display: flex;
   justify-content: center;
@@ -2232,29 +2172,17 @@ const myRack = computed(() => {
 .rack-tiles-container {
   display: flex;
   gap: min(6px, 1.5vw);
-  min-height: 40px;
+  min-height: 44px;
   justify-content: center;
   align-items: center;
   width: 100%;
   max-width: 100%;
 }
 
-/* Force children tile components inside the container row to scale intelligently */
 .rack-tiles-container > * {
   flex-shrink: 1 !important;
   max-width: calc((100% / 7) - 4px) !important;
   aspect-ratio: 1 / 1;
-}
-
-.rack { 
-  display: flex; 
-  gap: 8px; 
-  justify-content: center; 
-  background: #eae2d2; 
-  padding: 12px; 
-  border-radius: 8px; 
-  min-height: 56px; 
-  box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
 }
 
 .rack-base-shadow {
@@ -2269,16 +2197,14 @@ const myRack = computed(() => {
   z-index: 1;
 }
 
-/* THE SPLIT CONTROLS PANEL GRID RULES */
 .controls { 
   display: grid; 
   grid-template-columns: 1fr 1fr; 
   gap: 16px; 
   width: 100%;
   max-width: 100%; 
-  margin: 8px auto; 
   background: #1a252f; 
-  padding: 12px; 
+  padding: 14px; 
   border-radius: 8px; 
   border: 1px solid #34495e; 
   text-align: left; 
@@ -2332,18 +2258,17 @@ const myRack = computed(() => {
   justify-content: center; 
 }
 
-/* ACTION BUTTON MATRIX BUTTON DESIGN CONFIG */
 .action-button-matrix-row {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   width: 100%;
 }
 
 .control-btn {
-  padding: 10px 12px;
+  padding: 12px;
   border: none;
   border-radius: 6px;
-  font-size: min(13px, 3.2vw);
+  font-size: min(13px, 3.5vw);
   font-weight: 700;
   cursor: pointer;
   transition: all 0.15s ease;
@@ -2374,7 +2299,6 @@ const myRack = computed(() => {
   color: #ffffff;
 }
 
-/* ALERTS SYSTEM ERROR LABELS */
 .error-console-wrapper {
   min-height: 20px;
   width: 100%;
@@ -2474,7 +2398,6 @@ const myRack = computed(() => {
   margin-top: 4px;
 }
 
-/* LOGS TIMELINE TIMESTAMPS STYLE */
 .history-section {
   flex: 1;
   display: flex;
@@ -2570,7 +2493,6 @@ const myRack = computed(() => {
   z-index: 9998;
 }
 
-/* SYSTEM INTERFACE GLOBAL OVERLAY CONFIRM MODALS */
 .confirm-modal-backdrop {
   position: fixed;
   top: 0;
@@ -2601,7 +2523,6 @@ const myRack = computed(() => {
 .btn-cancel { background: #eee; color: #333; }
 .btn-confirm-forfeit { background: #c62828; color: white; }
 
-/* BINGO CELEBRATION POPUPS */
 .bingo-popup-overlay {
   position: fixed;
   top: 20%;
@@ -2620,14 +2541,12 @@ const myRack = computed(() => {
 .bingo-popup-overlay h2 { margin: 0; font-size: 30px; font-weight: 900; color: #1a202c; letter-spacing: 1px; text-shadow: 0 2px 4px rgba(255,255,255,0.4); }
 .bingo-popup-overlay p { margin: 4px 0 0 0; font-size: 13px; font-weight: 700; color: #2d3748; }
 
-/* --- VUE TRANSITIONS RULES ANIMATIONS --- */
 .fade-enter-active, .fade-leave-active { transition: opacity 0.3s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
 
 .dropdown-slide-enter-active, .dropdown-slide-leave-active { transition: all 0.2s ease; }
 .dropdown-slide-enter-from, .dropdown-slide-leave-to { opacity: 0; transform: translateY(-10px); }
 
-/* LOADING OVERLAYS */
 .loading-overlay {
   position: fixed;
   top: 0;
@@ -2667,8 +2586,11 @@ const myRack = computed(() => {
   font-size: 14px;
 }
 
-/* --- MOBILE & HIGH FIDELITY ADAPTATION RECTIFIER INJECTIONS --- */
+/* --- MOBILE & PHYSICAL DEVICE ADAPTATION --- */
 @media (max-width: 768px) {
+  .lobby-wrapper {
+    overflow-y: auto;
+  }
   .lobby-brand-bar {
     padding: 12px 16px;
   }
@@ -2688,10 +2610,19 @@ const myRack = computed(() => {
     height: 56px;
   }
   .arena-scoreboard {
-    display: none; /* Hide top raw values in favor of the clean dedicated dashboard panel below */
+    display: none; 
   }
   .live-status-ticker {
     max-width: 180px;
+  }
+
+  .arena-layout-plane {
+    padding: 12px 8px;
+    justify-content: flex-start; /* Stack items tightly starting from top */
+  }
+
+  .board-wrapper {
+    margin-bottom: 24px !important; /* Forces the physical layout engine to maintain a space gap below the board */
   }
 
   .board-wrapper-frame {
@@ -2699,7 +2630,6 @@ const myRack = computed(() => {
     width: 100%;
     max-width: 100%;
     box-sizing: border-box;
-    margin-bottom: 0px !important;
   }
 
   :deep(.board-grid), 
@@ -2715,11 +2645,10 @@ const myRack = computed(() => {
     font-size: min(10px, 2.5vw) !important;
   }
 
-  .board-wrapper {
-    margin-bottom: 12px;
+  .player-interaction-dock {
+    margin-top: 0;
   }
 
-  /* Stack the lower interface rows clean vertically inside the action section dashboard box */
   .controls {
     grid-template-columns: 1fr;
     gap: 12px;
